@@ -1,0 +1,504 @@
+rules_version = '2';
+
+// Fireplace Firestore rules. The server only ever holds public keys and
+// ciphertext envelopes. See docs/BUILD_PLAN.md section 4 for the data model.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    // Set by the operator tooling (custom claim `banned`); takes effect when the
+    // person's ID token refreshes (within the hour), at which point sign-in also fails.
+    function notBanned() { return request.auth.token.get('banned', false) != true; }
+    function isOwner(uid) { return signedIn() && request.auth.uid == uid; }
+    function validUsername(n) { return n is string && n.matches('^[a-z0-9_]{3,20}$'); }
+    function hasOnly(keys) { return request.resource.data.keys().hasOnly(keys); }
+    function hasAll(keys) { return request.resource.data.keys().hasAll(keys); }
+    function userPath(uid) { return /databases/$(database)/documents/users/$(uid); }
+    function usernamePath(n) { return /databases/$(database)/documents/usernames/$(n); }
+    function devicePath(uid, dev) { return /databases/$(database)/documents/users/$(uid)/devices/$(dev); }
+    function blockPath(owner, blocked) { return /databases/$(database)/documents/users/$(owner)/blocks/$(blocked); }
+    function invitePath(h) { return /databases/$(database)/documents/invites/$(h); }
+    function limitPath(uid) { return /databases/$(database)/documents/users/$(uid)/limits/send; }
+    // Only people who signed up with an invite have a profile. Everything that costs us
+    // storage or reads requires one, so an account created without an invite is inert.
+    function hasProfile(uid) { return exists(userPath(uid)); }
+    // Deletion fence. Once an account is flagged `deleting` (by the app or by the operator's
+    // `fp-ops delete`) its devices can still DELETE what they own, but can no longer create or
+    // change anything, so no installation can add records behind the clean-up's back. A missing
+    // profile makes this rule fail, which is what we want for an account that is already gone.
+    function notDeleting(uid) { return get(userPath(uid)).data.get('deleting', false) != true; }
+    // Moderator dashboard login. fp-ops sets the custom claim on an Auth account that has
+    // no profile. A profile would mean this is a real Fireplace account, which must not be
+    // able to read every report. Banned tokens cannot read either.
+    function isModerator() {
+      return signedIn()
+        && request.auth.token.get('moderator', false) == true
+        && request.auth.token.get('banned', false) != true
+        && !hasProfile(request.auth.uid);
+    }
+    // Message pacing (decision 0015), per account across all chats. Every message comes
+    // with a write of the sender's `limits/send` clock at request.time, in the same batch;
+    // that write's own rule (below) decides whether the account may send now.
+    function sendPaced() {
+      return getAfter(limitPath(request.auth.uid)).data.get('at', null) == request.time;
+    }
+    // A window of 10 s in which an account may send up to 20 messages: a burst goes out
+    // at once, and the average stays at the earlier limit of 2 a second.
+    function sendWindow() { return duration.value(10, 's'); }
+    function sendBurst() { return 20; }
+    // And at most 2,000 messages (reactions included) in a day of 24 hours from the first
+    // one. Past that, sends are refused until the day ends.
+    function sendDay() { return duration.value(1, 'd'); }
+    function sendDailyCap() { return restricted() ? 200 : 2000; }
+    // Set for a while by the spam filter or `fp-ops restrict` (decision 0018) as the
+    // custom claim `restrictedUntil` (ms): the account keeps working with lower daily caps.
+    // Read from the ID token, so it costs nothing; it applies once the token refreshes.
+    function restricted() {
+      return request.auth.token.get('restrictedUntil', 0) > request.time.toMillis();
+    }
+    // A push challenge (decision 0020). The claim is on the ID token, so an
+    // unchallenged send costs no reads. Once it is set, sends wait for a proof
+    // whose token matches the server-only hold.
+    function challengeHold(uid) {
+      return /databases/$(database)/documents/challengeHolds/$(uid);
+    }
+    function challengeProof(uid) {
+      return /databases/$(database)/documents/users/$(uid)/challengeProof/current;
+    }
+    function challenged() {
+      return request.auth.token.get('challengeUntil', 0) > request.time.toMillis();
+    }
+    function challengeSolved() {
+      return get(challengeProof(request.auth.uid)).data.get('token', '')
+        == get(challengeHold(request.auth.uid)).data.get('token', '');
+    }
+    // The owner writes the token the push delivered. A later challenge replaces it.
+    function challengeAnswer(uid, docId) {
+      return isOwner(uid) && notDeleting(uid) && docId == 'current'
+        && hasOnly(['token']) && hasAll(['token'])
+        && request.resource.data.token is string
+        && request.resource.data.token.size() == 64
+        && request.resource.data.token.matches('^[0-9a-f]{64}$')
+        && request.resource.data.token == get(challengeHold(uid)).data.token;
+    }
+    // Other actions counted per day (decision 0017), in users/{uid}/limits/{name}: new chats
+    // started, and one-time prekeys claimed from other accounts' devices.
+    function countPath(uid, name) { return /databases/$(database)/documents/users/$(uid)/limits/$(name); }
+    function dailyCap(name) {
+      return name == 'chats' ? (restricted() ? 5 : 50) : (restricted() ? 20 : 200);
+    }
+    // The action is counted: its counter is written in the same batch (apps from v0.3.4).
+    function counted(name) {
+      return getAfter(countPath(request.auth.uid, name)).data.get('at', null) == request.time;
+    }
+    // The previous window is over (or the clock is in the older one-gap form, and that
+    // gap has passed). Required before starting a window or writing the older form, so
+    // switching between the two forms gives no extra messages.
+    function sendWindowOver() {
+      return 'window' in resource.data
+        ? request.time >= resource.data.window + sendWindow()
+        : resource.data.at <= request.time - duration.value(500, 'ms');
+    }
+    function chatPath(id) { return /databases/$(database)/documents/chats/$(id); }
+
+    // usernames/{username} -> { uid }. Create-only, so names are unique and permanent.
+    match /usernames/{username} {
+      allow get: if signedIn() && hasProfile(request.auth.uid);
+      allow list: if false; // no enumeration
+      allow create: if signedIn()
+        && validUsername(username)
+        && hasOnly(['uid']) && hasAll(['uid'])
+        && request.resource.data.uid == request.auth.uid
+        && request.auth.token.email == username + '@users.fireplace.invalid'
+        // must be created in the same batch as the matching user doc
+        && getAfter(userPath(request.auth.uid)).data.username == username;
+      allow update: if false;
+      // released when the owner deletes their account
+      allow delete: if signedIn() && resource.data.uid == request.auth.uid;
+    }
+
+    // users/{uid}: public profile. Contains no email/phone.
+    match /users/{uid} {
+      allow get: if isOwner(uid) || (signedIn() && hasProfile(request.auth.uid));
+      allow list: if false;
+      // Sign-up needs an unused invite, claimed in the same batch (see /invites).
+      allow create: if isOwner(uid)
+        && hasOnly(['username', 'displayName', 'createdAt', 'invite'])
+        && hasAll(['username', 'displayName', 'createdAt', 'invite'])
+        && request.resource.data.invite is string
+        && request.resource.data.invite.matches('^[0-9a-f]{64}$')
+        && getAfter(invitePath(request.resource.data.invite)).data.get('usedBy', null) == uid
+        && validUsername(request.resource.data.username)
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() <= 40
+        && request.resource.data.createdAt == request.time
+        && getAfter(usernamePath(request.resource.data.username)).data.uid == uid;
+      allow update: if isOwner(uid) && notDeleting(uid)
+        && hasOnly(['username', 'displayName', 'createdAt', 'deleting', 'invite', 'lastActiveAt'])
+        && request.resource.data.get('invite', null) == resource.data.get('invite', null)
+        // Retention: accounts inactive for 13 months are deleted. `lastActiveAt` can only be set to the
+        // server time, and at most every 12 hours.
+        && (request.resource.data.get('lastActiveAt', null) == resource.data.get('lastActiveAt', null)
+            || (request.resource.data.lastActiveAt == request.time
+                && (resource.data.get('lastActiveAt', null) == null
+                    || request.time > resource.data.lastActiveAt + duration.value(12, 'h'))))
+        && request.resource.data.username == resource.data.username
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() <= 40
+        // `deleting` can be switched on (account deletion in progress) but never off
+        && (!('deleting' in request.resource.data) || request.resource.data.deleting == true)
+        && (!('deleting' in resource.data) || 'deleting' in request.resource.data);
+      allow delete: if isOwner(uid);
+
+      // users/{uid}/devices/{deviceId}: per-device public keys.
+      match /devices/{deviceId} {
+        allow get, list: if signedIn() && hasProfile(request.auth.uid);
+        allow create: if isOwner(uid) && hasProfile(uid) && notDeleting(uid)
+          && deviceId.matches('^[A-Za-z0-9_-]{8,64}$')
+          && hasOnly(['x25519Pub', 'kemPub', 'sigPub', 'deviceCert', 'createdAt'])
+          && hasAll(['x25519Pub', 'kemPub', 'sigPub', 'deviceCert', 'createdAt'])
+          && request.resource.data.x25519Pub is string && request.resource.data.x25519Pub.size() <= 64
+          && request.resource.data.kemPub is string && request.resource.data.kemPub.size() <= 2048
+          && request.resource.data.sigPub is string && request.resource.data.sigPub.size() <= 4096
+          && request.resource.data.deviceCert is string && request.resource.data.deviceCert.size() <= 8192
+          && request.resource.data.createdAt == request.time;
+        // keys are immutable; the only allowed change is revoking the device
+        allow update: if isOwner(uid) && notDeleting(uid)
+          && hasOnly(['x25519Pub', 'kemPub', 'sigPub', 'deviceCert', 'createdAt', 'revokedAt'])
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['revokedAt'])
+          && request.resource.data.revokedAt == request.time;
+        allow delete: if isOwner(uid);
+
+        // users/{uid}/devices/{deviceId}/prekeys/{id}: public prekeys that peers
+        // claim to start sessions (signed prekey + a pool of one-time prekeys).
+        match /prekeys/{pkId} {
+          allow get, list: if signedIn() && hasProfile(request.auth.uid);
+          allow create: if isOwner(uid) && hasProfile(uid) && notDeleting(uid)
+            && pkId.matches('^[A-Za-z0-9_-]{6,32}$')
+            && hasOnly(['kind', 'x25519Pub', 'kemPub', 'sig', 'createdAt'])
+            && hasAll(['kind', 'x25519Pub', 'kemPub', 'createdAt'])
+            && request.resource.data.kind in ['signed', 'onetime']
+            && request.resource.data.x25519Pub is string && request.resource.data.x25519Pub.size() <= 64
+            && request.resource.data.kemPub is string && request.resource.data.kemPub.size() <= 2048
+            && (request.resource.data.kind == 'onetime' ? !('sig' in request.resource.data)
+                : (request.resource.data.sig is string && request.resource.data.sig.size() <= 8192))
+            && request.resource.data.createdAt == request.time;
+          allow update: if false;
+          // The owner can delete any of their prekeys. Anyone with a profile can delete a
+          // ONE-TIME prekey: that is how a person starting a session claims it atomically
+          // (read + delete in one transaction), so two people never share one. The worst
+          // abuse is draining the pool, which only means sessions fall back to the signed
+          // prekey until the owner's app refills the pool.
+          allow delete: if isOwner(uid)
+            || (signedIn() && hasProfile(request.auth.uid) && resource.data.kind == 'onetime'
+                && counted('claims')
+                && (!challenged() || challengeSolved()));
+        }
+      }
+
+      // FCM routing credentials are private to the account that owns each device.
+      // The delivery function (functions/, `pushOnMessage`) uses Admin access; peers
+      // never need to see tokens. `showName` false makes alerts on this device say
+      // "Fireplace" instead of the sender's username; `sound` false sends them
+      // without the pop. Older apps omit both.
+      match /pushTokens/{deviceId} {
+        allow get, list, delete: if isOwner(uid);
+        allow create, update: if isOwner(uid) && hasProfile(uid) && notDeleting(uid)
+          && deviceId.matches('^[A-Za-z0-9_-]{8,64}$')
+          && exists(devicePath(uid, deviceId))
+          && get(devicePath(uid, deviceId)).data.get('revokedAt', null) == null
+          && hasOnly(['token', 'platform', 'showName', 'sound', 'dataPush', 'updatedAt'])
+          && hasAll(['token', 'platform', 'updatedAt'])
+          && request.resource.data.get('showName', true) is bool
+          && request.resource.data.get('sound', true) is bool
+          // The app decrypts and shows the alert itself (decision 0019).
+          && request.resource.data.get('dataPush', false) is bool
+          && request.resource.data.token is string
+          && request.resource.data.token.size() >= 20
+          && request.resource.data.token.size() <= 4096
+          && request.resource.data.platform in ['ios', 'android']
+          && request.resource.data.updatedAt == request.time;
+      }
+    }
+
+    // users/{uid}/private/backup: identity encrypted client-side with the user's
+    // recovery key. Owner-only; the server cannot read its contents.
+    match /users/{uid}/private/{docId} {
+      allow read, delete: if isOwner(uid) && docId == 'backup';
+      allow create, update: if isOwner(uid) && docId == 'backup' && hasProfile(uid) && notDeleting(uid)
+        && hasOnly(['blob', 'v', 'createdAt']) && hasAll(['blob', 'v', 'createdAt'])
+        && request.resource.data.v == 1
+        && request.resource.data.blob is string
+        && request.resource.data.blob.size() <= 30000
+        && request.resource.data.createdAt == request.time;
+    }
+
+    // users/{uid}/linkRequests/{deviceId}: a new device asks an existing device of
+    // the same account for the identity. Owner-only; contents are public keys and
+    // a sealed (encrypted) response.
+    match /users/{uid}/linkRequests/{reqId} {
+      allow get, list, delete: if isOwner(uid);
+      allow create: if isOwner(uid) && hasProfile(uid) && notDeleting(uid)
+        && reqId.matches('^[A-Za-z0-9_-]{8,64}$')
+        && hasOnly(['x25519Pub', 'kemPub', 'createdAt'])
+        && hasAll(['x25519Pub', 'kemPub', 'createdAt'])
+        && request.resource.data.x25519Pub is string && request.resource.data.x25519Pub.size() <= 64
+        && request.resource.data.kemPub is string && request.resource.data.kemPub.size() <= 2048
+        && request.resource.data.createdAt == request.time;
+      allow update: if isOwner(uid) && notDeleting(uid)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['response'])
+        && !('response' in resource.data)
+        && request.resource.data.response is map
+        && request.resource.data.response.keys().hasOnly(['ek', 'kemCt', 'nonce', 'ct', 'mac'])
+        && request.resource.data.response.size() == 5;
+    }
+
+    // users/{uid}/challengeProof/current: the token from the challenge push
+    // (decision 0020). The owner writes it, and replaces it for a later one.
+    match /users/{uid}/challengeProof/{docId} {
+      allow get: if isOwner(uid) && docId == 'current';
+      allow list: if false;
+      allow create, update: if challengeAnswer(uid, docId);
+      allow delete: if isOwner(uid) && docId == 'current'
+        && (!hasProfile(uid) || get(userPath(uid)).data.get('deleting', false) == true);
+    }
+
+    // users/{uid}/blocks/{blockedUid}: people this user blocked. Owner-only.
+    // The chat/message rules consult it (exists() works even though others cannot read it).
+    match /users/{uid}/blocks/{blockedUid} {
+      allow get, list, delete: if isOwner(uid);
+      allow create: if isOwner(uid) && hasProfile(uid) && notDeleting(uid)
+        && blockedUid != uid
+        && blockedUid.matches('^[^_/]{1,128}$')
+        && hasOnly(['createdAt']) && hasAll(['createdAt'])
+        && request.resource.data.createdAt == request.time;
+      allow update: if false;
+    }
+
+    // reports/{reporter}_{reported}: the app's spam report (app decision 0024). It is
+    // exactly the two account ids, reason "spam" and the time. No note, context or
+    // chat id is accepted, so a report can never carry message text. Write-only for
+    // app accounts; a moderator login (see isModerator) may read them. Nobody can
+    // delete them. One per pair: reporting again replaces the time.
+    // reviewQueue/{uid}: accounts the spam filter restricted or flagged, with its reasons
+    // (decision 0018). Written by the server only; the moderator login may read it.
+    match /reviewQueue/{uid} {
+      allow get, list: if isModerator();
+      allow write: if false;
+    }
+
+    match /reports/{reportId} {
+      function reportOk() {
+        return hasOnly(['reporter', 'reported', 'reason', 'createdAt'])
+          && hasAll(['reporter', 'reported', 'reason', 'createdAt'])
+          && request.resource.data.reporter == request.auth.uid
+          && request.resource.data.reported is string
+          && request.resource.data.reported != request.auth.uid
+          && reportId == request.auth.uid + '_' + request.resource.data.reported
+          && request.resource.data.reason == 'spam'
+          && request.resource.data.createdAt == request.time;
+      }
+      allow create: if signedIn() && hasProfile(request.auth.uid) && notDeleting(request.auth.uid) && reportOk();
+      allow update: if signedIn() && resource.data.reporter == request.auth.uid && notDeleting(request.auth.uid) && reportOk();
+      allow get, list: if isModerator();
+      allow delete: if false;
+    }
+
+    // invites/{sha256(code)}: created by the operator (Admin SDK, see tools/operator).
+    // A new account claims one in the same batch that creates its profile. Clients can
+    // neither read nor create invites; the hash of the code is the document id, so the
+    // code itself is never stored.
+    match /invites/{hash} {
+      allow get, list, create, delete: if false;
+      // A moderator token must not claim an invite: that is how an account gets a profile,
+      // and a profile would put this login on the normal app path.
+      allow update: if signedIn()
+        && request.auth.token.get('moderator', false) != true
+        && hash.matches('^[0-9a-f]{64}$')
+        && !('usedBy' in resource.data)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['usedBy', 'usedAt'])
+        && request.resource.data.usedBy == request.auth.uid
+        && request.resource.data.usedAt == request.time;
+    }
+
+    // users/{uid}/limits/send: this account's send clock, written with every message.
+    // `at` is the time of the last message; `window` and `sent` the current 10 s window and
+    // how many went out in it; `day` and `today` the current day and its count. The app
+    // writes one of three forms, none of which needs a read first:
+    //   a new day     set({at, window, sent: 1, day, today: 1})   (all times the server time)
+    //   a new window  update({at, window, sent: 1, today: +1})
+    //   the next one  update({at, sent: +1, today: +1})
+    // The older form `{at}` (apps before v0.3.3) is no longer accepted (issue #12). A clock
+    // an older app left in that form is replaced by the next day form after its 500 ms gap.
+    match /users/{uid}/limits/{docId} {
+      function sendClock() { return request.resource.data.at == request.time; }
+      function clockFields() { return hasOnly(['at', 'window', 'sent', 'day', 'today']); }
+      function dayRunning() {
+        return 'day' in resource.data && request.time < resource.data.day + sendDay();
+      }
+      function countsInDay() {
+        return dayRunning()
+          && request.resource.data.day == resource.data.day
+          && request.resource.data.today == resource.data.today + 1
+          && request.resource.data.today <= sendDailyCap();
+      }
+      function opensDay() {
+        return request.resource.data.day == request.time && request.resource.data.today == 1;
+      }
+      function opensWindow() {
+        return request.resource.data.window == request.time && request.resource.data.sent == 1;
+      }
+      function continuesWindow() {
+        return 'window' in resource.data
+          && request.resource.data.window == resource.data.window
+          && request.time < resource.data.window + sendWindow()
+          && request.resource.data.sent == resource.data.sent + 1
+          && request.resource.data.sent <= sendBurst();
+      }
+      // `chats` and `claims`: {at, day, today}, written with the action they count. The app
+      // writes `update({at, today: +1})` in a running day, or `set({at, day, today: 1})`.
+      function dayCounter() {
+        return hasOnly(['at', 'day', 'today']) && sendClock()
+          && (countsUnder(dailyCap(docId)) || (opensDay() && !dayRunning()));
+      }
+      function countsUnder(cap) {
+        return dayRunning()
+          && request.resource.data.day == resource.data.day
+          && request.resource.data.today == resource.data.today + 1
+          && request.resource.data.today <= cap;
+      }
+      allow get: if isOwner(uid) && docId in ['send', 'chats', 'claims'];
+      allow create: if isOwner(uid) && docId in ['chats', 'claims'] && hasProfile(uid)
+        && notDeleting(uid) && hasOnly(['at', 'day', 'today']) && sendClock() && opensDay();
+      allow update: if isOwner(uid) && docId in ['chats', 'claims'] && notDeleting(uid)
+        && dayCounter();
+      allow delete: if isOwner(uid) && docId in ['chats', 'claims']
+        && (!hasProfile(uid) || get(userPath(uid)).data.get('deleting', false) == true);
+      // Deleting the clock would restart the counts, so only account deletion may (the app
+      // marks the profile `deleting` first; a profile already gone counts too).
+      allow delete: if isOwner(uid) && docId == 'send'
+        && (!hasProfile(uid) || get(userPath(uid)).data.get('deleting', false) == true);
+      allow create: if isOwner(uid) && docId == 'send' && hasProfile(uid) && notDeleting(uid)
+        && sendClock() && clockFields() && opensWindow() && opensDay();
+      allow update: if isOwner(uid) && docId == 'send' && notDeleting(uid) && sendClock()
+        && clockFields()
+        && (countsInDay() || (opensDay() && !dayRunning()))
+        && (continuesWindow() || (opensWindow() && sendWindowOver()));
+      allow list: if false;
+    }
+
+    // chats/{chatId}: exactly two participants, id = "<uidA>_<uidB>" with uidA < uidB.
+    // The creator is the "initiator". Until the other person accepts, the initiator may
+    // send at most 3 messages (a "message request"); the counter is bumped in the same
+    // batch as each message. The recipient accepts explicitly or by replying.
+    match /chats/{chatId} {
+      function isParticipant() { return signedIn() && request.auth.uid in chatId.split('_'); }
+      function peerUid() {
+        return chatId.split('_')[0] == request.auth.uid ? chatId.split('_')[1] : chatId.split('_')[0];
+      }
+      function chatBefore() { return get(chatPath(chatId)).data; }
+      function chatAfter() { return getAfter(chatPath(chatId)).data; }
+
+      allow get: if isParticipant();
+      allow list: if signedIn()
+        && request.auth.uid in resource.data.participants; // must be filtered by participants
+      allow create: if signedIn() && notBanned() && notDeleting(request.auth.uid)
+        && (!challenged() || challengeSolved())
+        && hasOnly(['participants', 'createdAt', 'lastMessageAt', 'initiator', 'accepted', 'requestCount'])
+        && hasAll(['participants', 'createdAt', 'lastMessageAt', 'initiator', 'accepted', 'requestCount'])
+        && request.resource.data.participants is list
+        && request.resource.data.participants.size() == 2
+        && request.resource.data.participants[0] < request.resource.data.participants[1]
+        && request.resource.data.participants[0].matches('^[^_]+$')
+        && request.resource.data.participants[1].matches('^[^_]+$')
+        && chatId == request.resource.data.participants[0] + '_' + request.resource.data.participants[1]
+        && request.auth.uid in request.resource.data.participants
+        && request.resource.data.initiator == request.auth.uid
+        && request.resource.data.accepted == false
+        && request.resource.data.requestCount == 0
+        && counted('chats')
+        && exists(userPath(request.resource.data.participants[0]))
+        && exists(userPath(request.resource.data.participants[1]))
+        && !exists(blockPath(
+             request.resource.data.participants[0] == request.auth.uid
+               ? request.resource.data.participants[1] : request.resource.data.participants[0],
+             request.auth.uid))
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.lastMessageAt == request.time;
+      allow update: if isParticipant() && notBanned() && notDeleting(request.auth.uid)
+        && request.resource.data.lastMessageAt == request.time
+        && (
+          // plain activity bump
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastMessageAt'])
+          // initiator sends a request message: counter +1, at most 3 while unaccepted
+          || (resource.data.initiator == request.auth.uid
+              && resource.data.accepted == false
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastMessageAt', 'requestCount'])
+              && request.resource.data.requestCount == resource.data.requestCount + 1
+              && request.resource.data.requestCount <= 3)
+          // the other person accepts (alone or together with a reply)
+          || (resource.data.initiator != request.auth.uid
+              && resource.data.accepted == false
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastMessageAt', 'accepted'])
+              && request.resource.data.accepted == true)
+        );
+      // Either participant may remove the chat document once the OTHER person's
+      // profile is gone (their account was deleted). Otherwise chats are permanent.
+      allow delete: if isParticipant() && !exists(userPath(peerUid()));
+
+      // Messages: per-recipient-device ciphertext envelopes. No plaintext fields allowed.
+      match /messages/{msgId} {
+        allow get, list: if isParticipant();
+        allow create: if isParticipant() && notBanned() && notDeleting(request.auth.uid)
+          && (!challenged() || challengeSolved())
+          && hasOnly(['senderUid', 'senderDevice', 'ts', 'envelopes', 'expireAt'])
+          && hasAll(['senderUid', 'senderDevice', 'ts', 'envelopes', 'expireAt'])
+          && request.resource.data.senderUid == request.auth.uid
+          && request.resource.data.senderDevice is string
+          && request.resource.data.senderDevice.size() <= 64
+          && get(devicePath(request.auth.uid, request.resource.data.senderDevice)).data.get('revokedAt', null) == null
+          && request.resource.data.ts == request.time
+          // Retention: `expireAt` is the date after which the server copy may be purged. The operator's
+          // `fp-ops purge-messages` deletes messages past it (run by hand; there is no automatic TTL).
+          // The client computes it from its own clock, so allow a couple of days of skew.
+          && request.resource.data.expireAt is timestamp
+          && request.resource.data.expireAt >= request.time + duration.value(28, 'd')
+          && request.resource.data.expireAt <= request.time + duration.value(32, 'd')
+          && request.resource.data.envelopes is map
+          && request.resource.data.envelopes.size() >= 1
+          && request.resource.data.envelopes.size() <= 40
+          && !exists(blockPath(peerUid(), request.auth.uid))
+          && sendPaced()
+          && (
+            // accepted chat (chats created before requests existed count as accepted)
+            chatBefore().get('accepted', true) == true
+            // initiator within the request allowance (counter bumped in this batch)
+            || (chatBefore().initiator == request.auth.uid
+                && chatAfter().requestCount == chatBefore().requestCount + 1
+                && chatAfter().requestCount <= 3)
+            // recipient replying (acceptance written in this batch)
+            || (chatBefore().initiator != request.auth.uid && chatAfter().accepted == true)
+          );
+        allow update: if false;
+        // You can delete what you sent (used when deleting an account or cleaning up).
+        allow delete: if isParticipant() && resource.data.senderUid == request.auth.uid;
+      }
+    }
+
+    // challengeHolds/{uid}: the push-challenge token (decision 0020). Admin only.
+    // The rules read it with get(); clients cannot.
+    match /challengeHolds/{uid} {
+      allow read, write: if false;
+    }
+
+    // pushThrottle/{chatId}: when each participant was last alerted about this chat.
+    // Written by the push function only (Admin access); no client may read or write it.
+    // The catch-all below covers it; named here so the rule is deliberate.
+    match /pushThrottle/{chatId} {
+      allow read, write: if false;
+    }
+
+    match /{document=**} { allow read, write: if false; }
+  }
+}
