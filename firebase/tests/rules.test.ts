@@ -6,7 +6,7 @@ import {
   initializeTestEnvironment, assertSucceeds, assertFails,
 } from '@firebase/rules-unit-testing';
 import {
-  doc, getDoc, setDoc, updateDoc, deleteDoc, writeBatch, collection,
+  doc, getDoc, setDoc, updateDoc, deleteDoc, deleteField, writeBatch, collection,
   getDocs, query, where, orderBy, serverTimestamp, increment, runTransaction,
 } from 'firebase/firestore';
 
@@ -19,11 +19,20 @@ function emulatorHostPort() {
 let env;
 const email = (u) => `${u}@users.fireplace.invalid`;
 const uidByApp = new Map(); // firebase app name -> authenticated uid
-const ctx = (uid, username) => {
+const ctx = (uid, username?) => {
   const db = env.authenticatedContext(uid, { email: email(username ?? uid) }).firestore();
   uidByApp.set(db.app.name, uid);
   return db;
 };
+/** The same account signed in at a given time (seconds), as the ID token says. */
+const ctxAt = (uid, authTime) =>
+  env.authenticatedContext(uid, { email: email(uid), auth_time: authTime }).firestore();
+const nowSeconds = () => Math.floor(Date.now() / 1000);
+/** What only the server does: mark a device removed, or place a record. */
+async function asServer(run) {
+  await env.withSecurityRulesDisabled(async (c) => run(c.firestore()));
+}
+const revokeAsServer = (path) => asServer((db) => updateDoc(doc(db, path), { revokedAt: new Date() }));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const hashOf = (code) => createHash('sha256').update(code).digest('hex');
 const lastSend = new Map(); // uid -> ms; keeps ordinary tests under the 500 ms pacing rule
@@ -508,12 +517,13 @@ test('devices: owner creates, others read, others cannot write', async () => {
   await assertFails(setDoc(doc(ctx('alice'), 'users/alice/devices/x'), deviceDoc())); // bad id
   await assertFails(setDoc(doc(ctx('alice'), 'users/alice/devices/device-0003'), { ...deviceDoc(), extra: 1 }));
 });
-test('devices: keys immutable, revoke allowed', async () => {
+test('devices: keys immutable, and a device is not removed by writing to it', async () => {
   await signUp('alice', 'alice');
   const ref = doc(ctx('alice'), 'users/alice/devices/device-0001');
   await setDoc(ref, deviceDoc());
   await assertFails(updateDoc(ref, { x25519Pub: 'z'.repeat(44) }));
-  await assertSucceeds(updateDoc(ref, { revokedAt: serverTimestamp() }));
+  // Removal goes through a request the function checks (decision 0027).
+  await assertFails(updateDoc(ref, { revokedAt: serverTimestamp() }));
 });
 
 // ---------- chats ----------
@@ -582,7 +592,7 @@ test('unknown collections are denied', async () => {
 // ---------- recovery backup & device linking ----------
 const backupDoc = () => ({ blob: 'x'.repeat(9000), v: 1, createdAt: serverTimestamp() });
 
-test('backup: owner creates/reads/replaces/deletes; nobody else can read or write', async () => {
+test('backup: owner creates/reads/replaces; nobody else can read or write', async () => {
   await signUp('alice', 'alice'); await signUp('bob', 'bob');
   const ref = (c) => doc(ctx(c), 'users/alice/private/backup');
   await assertSucceeds(setDoc(ref('alice'), backupDoc()));
@@ -591,7 +601,8 @@ test('backup: owner creates/reads/replaces/deletes; nobody else can read or writ
   await assertFails(getDoc(ref('bob')));
   await assertFails(setDoc(ref('bob'), backupDoc()));
   await assertFails(deleteDoc(ref('bob')));
-  await assertSucceeds(deleteDoc(ref('alice')));
+  // Removing it goes with replacing the identity, which waits (decision 0027).
+  await assertFails(deleteDoc(ref('alice')));
 });
 test('backup: shape validated (other doc ids, extra fields, wrong version, oversize, fake time)', async () => {
   await signUp('alice', 'alice');
@@ -626,11 +637,114 @@ test('link request: bad id / extra fields rejected', async () => {
   await assertFails(setDoc(doc(ctx('alice'), 'users/alice/linkRequests/x'), linkReq()));
   await assertFails(setDoc(doc(ctx('alice'), 'users/alice/linkRequests/newdevice-0002'), { ...linkReq(), response: sealed() }));
 });
-test('owner may delete own device docs (identity reset); others may not', async () => {
+test('device records are deleted (identity reset) only by a start that is over its wait', async () => {
   await signUp('alice', 'alice'); await signUp('bob', 'bob');
-  await setDoc(doc(ctx('alice'), 'users/alice/devices/device-0001'), deviceDoc());
-  await assertFails(deleteDoc(doc(ctx('bob'), 'users/alice/devices/device-0001')));
-  await assertSucceeds(deleteDoc(doc(ctx('alice'), 'users/alice/devices/device-0001')));
+  const device = 'users/alice/devices/device-0001';
+  const backup = 'users/alice/private/backup';
+  await setDoc(doc(ctx('alice'), device), deviceDoc());
+  await setDoc(doc(ctx('alice'), backup), { blob: 'x', v: 1, createdAt: serverTimestamp() });
+  await assertFails(deleteDoc(doc(ctx('bob'), device)));
+  // No start at all: the password alone removes nothing.
+  await assertFails(deleteDoc(doc(ctx('alice'), device)));
+  await assertFails(deleteDoc(doc(ctx('alice'), backup)));
+  // A start that is still waiting.
+  const day = 86_400_000;
+  await asServer((db) => setDoc(doc(db, 'users/alice/private/startFresh'), {
+    startedAt: new Date(Date.now() - 2 * day), waitDays: 3, session: 1,
+  }));
+  await assertFails(deleteDoc(doc(ctx('alice'), device)));
+  await assertFails(deleteDoc(doc(ctx('alice'), backup)));
+  // Over its wait.
+  await asServer((db) => setDoc(doc(db, 'users/alice/private/startFresh'), {
+    startedAt: new Date(Date.now() - 3 * day - 60_000), waitDays: 3, session: 1,
+  }));
+  await assertFails(deleteDoc(doc(ctx('bob'), device)));
+  await assertSucceeds(deleteDoc(doc(ctx('alice'), backup)));
+  await assertSucceeds(deleteDoc(doc(ctx('alice'), device)));
+});
+
+test('a start: the time of the server, the wait of the account, and only its own sign-in withdraws it', async () => {
+  await signUp('alice', 'alice'); await signUp('bob', 'bob');
+  const signedIn = nowSeconds() - 30;
+  const mine = ctxAt('alice', signedIn);
+  const ref = (db) => doc(db, 'users/alice/private/startFresh');
+  const start = (extra = {}) => ({ startedAt: serverTimestamp(), waitDays: 3, session: signedIn, ...extra });
+  await assertFails(setDoc(ref(ctx('bob')), start()));
+  await assertFails(setDoc(ref(mine), start({ startedAt: new Date(Date.now() - 4 * 86_400_000) })));
+  await assertFails(setDoc(ref(mine), start({ waitDays: 1 })));
+  await assertFails(setDoc(ref(mine), start({ session: signedIn - 1 })));
+  await assertFails(setDoc(ref(mine), start({ by: 'device' })));
+  await assertSucceeds(setDoc(ref(mine), start()));
+  await assertSucceeds(getDoc(ref(mine)));
+  await assertFails(getDoc(ref(ctx('bob'))));
+  // It cannot be moved back in time afterwards.
+  await assertFails(updateDoc(ref(mine), { startedAt: new Date(0) }));
+  // Another sign-in to the same account (a phone that was already signed in) cannot cancel it.
+  await assertFails(deleteDoc(ref(ctxAt('alice', signedIn - 86_400))));
+  await assertSucceeds(deleteDoc(ref(mine)));
+
+  // The account chose a week: a start must say a week.
+  await asServer((db) => setDoc(doc(db, 'users/alice/private/security'), { waitDays: 7 }));
+  await assertFails(setDoc(ref(mine), start()));
+  await assertSucceeds(setDoc(ref(mine), start({ waitDays: 7 })));
+});
+
+test('the wait is chosen while the account is new, and by nobody signed in after that', async () => {
+  await signUp('alice', 'alice'); await signUp('bob', 'bob');
+  const ref = (db) => doc(db, 'users/alice/private/security');
+  await assertFails(setDoc(ref(ctx('bob')), { waitDays: 7 }));
+  await assertFails(setDoc(ref(ctx('alice')), { waitDays: 2 }));
+  await assertFails(setDoc(ref(ctx('alice')), { waitDays: 7, extra: 1 }));
+  await assertSucceeds(setDoc(ref(ctx('alice')), { waitDays: 7 }));
+  await assertSucceeds(getDoc(ref(ctx('alice'))));
+  await assertFails(setDoc(ref(ctx('alice')), { waitDays: 1 }));
+  await assertFails(updateDoc(ref(ctx('alice')), { waitDays: 1 }));
+  await assertFails(deleteDoc(ref(ctx('alice'))));
+
+  // An account from before this, or older than a few minutes, has no such door.
+  await asServer((db) => updateDoc(doc(db, 'users/bob'), { createdAt: new Date(Date.now() - 3_600_000) }));
+  await assertFails(setDoc(doc(ctx('bob'), 'users/bob/private/security'), { waitDays: 1 }));
+});
+
+test('device requests: shape, and stopping needs the password typed just now', async () => {
+  await signUp('alice', 'alice'); await signUp('bob', 'bob');
+  const fresh = ctxAt('alice', nowSeconds() - 20);
+  const old = ctxAt('alice', nowSeconds() - 86_400);
+  const op = (db, id) => doc(db, `users/alice/accountOps/${id}`);
+  const request = (kind, extra = {}) => ({
+    kind, device: 'device-0001', proof: 'A'.repeat(44), at: serverTimestamp(), ...extra,
+  });
+  await assertFails(setDoc(op(ctx('bob'), 'request-0001'), request('setWait', { waitDays: 7 })));
+  await assertFails(setDoc(op(old, 'short'), request('setWait', { waitDays: 7 })));
+  await assertFails(setDoc(op(old, 'request-0002'), request('promote')));
+  await assertFails(setDoc(op(old, 'request-0003'), request('setWait', { status: 'done' })));
+  await assertFails(setDoc(op(old, 'request-0004'), { ...request('setWait'), at: new Date(0) }));
+  await assertSucceeds(setDoc(op(old, 'request-0005'), request('setWait', { waitDays: 7 })));
+  await assertSucceeds(setDoc(op(old, 'request-0006'), request('removeDevice', { target: 'device-0002' })));
+  await assertSucceeds(setDoc(op(old, 'request-0007'), request('resetNow')));
+  // Asking the server to make its key carries nothing else.
+  await assertSucceeds(setDoc(op(old, 'request-0010'), { kind: 'key', at: serverTimestamp() }));
+  await assertFails(setDoc(op(old, 'request-0011'), { kind: 'key', at: serverTimestamp(), waitDays: 1 }));
+  await assertFails(setDoc(op(ctx('bob'), 'request-0012'), { kind: 'key', at: serverTimestamp() }));
+  // A phone that was signed in long ago (a stolen one) cannot ask to stop.
+  await assertFails(setDoc(op(old, 'request-0008'), request('stop')));
+  await assertSucceeds(setDoc(op(fresh, 'request-0009'), request('stop')));
+  // The outcome is the function's to write.
+  await assertFails(updateDoc(op(fresh, 'request-0009'), { status: 'done' }));
+  await assertFails(deleteDoc(op(fresh, 'request-0009')));
+  await assertSucceeds(getDoc(op(fresh, 'request-0009')));
+  await assertFails(getDoc(op(ctx('bob'), 'request-0009')));
+});
+
+test('the server key: its public half is readable, its secret half is not', async () => {
+  await signUp('alice', 'alice');
+  await asServer(async (db) => {
+    await setDoc(doc(db, 'config/deviceProof'), { x25519Pub: 'x' });
+    await setDoc(doc(db, 'private/deviceProof'), { x25519Seed: 'y' });
+  });
+  await assertSucceeds(getDoc(doc(ctx('alice'), 'config/deviceProof')));
+  await assertFails(setDoc(doc(ctx('alice'), 'config/deviceProof'), { x25519Pub: 'z' }));
+  await assertFails(getDoc(doc(ctx('alice'), 'private/deviceProof')));
 });
 
 // ---------- hardening from the review ----------
@@ -640,7 +754,7 @@ test('message: sender device must exist, belong to the sender, and not be revoke
   await assertSucceeds(setMsg(m('alice', 'ok'), msg('alice')));
   await assertFails(setMsg(m('alice', 'ghost'), msg('alice', { senderDevice: 'no-such-device' })));
   await assertFails(setMsg(m('alice', 'stolen'), msg('alice', { senderDevice: 'dev-of-bob' })));
-  await updateDoc(doc(ctx('alice'), 'users/alice/devices/dev-of-alice'), { revokedAt: serverTimestamp() });
+  await revokeAsServer('users/alice/devices/dev-of-alice');
   await assertFails(setMsg(m('alice', 'revoked'), msg('alice')));
 });
 test('chat: uids containing underscores cannot form a chat', async () => {
@@ -861,9 +975,9 @@ test('reports: a profile-less moderator can read reports, and cannot write or re
 
   const db = moderatorDb();
   const snap = await assertSucceeds(getDoc(doc(db, 'reports', 'alice_bob')));
-  assert.equal(snap.data().reason, 'spam');
-  assert.equal(snap.data().note, undefined, 'no text field exists on a report');
-  assert.equal(snap.data().operatorNote, 'kept');
+  assert.equal(snap.data()!.reason, 'spam');
+  assert.equal(snap.data()!.note, undefined, 'no text field exists on a report');
+  assert.equal(snap.data()!.operatorNote, 'kept');
   const listed = await assertSucceeds(
     getDocs(query(collection(db, 'reports'), orderBy('createdAt', 'desc'))),
   );
@@ -956,10 +1070,63 @@ test('deletion: all of an owner\'s private documents can be removed', async () =
   await setDoc(a('users/alice/private/backup'), backupDoc());
   await setDoc(a('users/alice/linkRequests/newdevice-0001'), linkReq());
   await setDoc(a('users/alice/blocks/bob'), { createdAt: serverTimestamp() });
+  // A live account keeps its devices and backup (decision 0027); one being deleted does not.
+  await assertFails(deleteDoc(a('users/alice/devices/device-0001')));
+  await assertFails(deleteDoc(a('users/alice/private/backup')));
+  await asServer((db) => updateDoc(doc(db, 'users/alice'), { deleting: true }));
   for (const path of [
     'users/alice/devices/device-0001/prekeys/opk-000001', 'users/alice/devices/device-0001',
     'users/alice/private/backup', 'users/alice/linkRequests/newdevice-0001', 'users/alice/blocks/bob',
   ]) await assertSucceeds(deleteDoc(a(path)));
+});
+
+test('deletion: the complete paged client cleanup resumes after profile removal without listing counters', async () => {
+  await setupChat();
+  const alice = ctx('alice'), bob = ctx('bob');
+  await env.withSecurityRulesDisabled(async c => {
+    const db = c.firestore();
+    await setDoc(doc(db, 'users/alice/devices/device-0001/prekeys/opk-000001'), pkDoc('onetime'));
+    await setDoc(doc(db, 'users/alice/pushTokens/device-0001'), pushToken());
+    await setDoc(doc(db, 'users/alice/private/backup'), backupDoc());
+    await setDoc(doc(db, 'users/alice/blocks/eve'), { createdAt: new Date() });
+    await setDoc(doc(db, 'users/alice/linkRequests/newdevice-0001'), linkReq());
+    await setDoc(doc(db, 'users/alice/challengeProof/current'), { token: 'test' });
+    for (const name of ['send', 'chats', 'claims']) await setDoc(doc(db, `users/alice/limits/${name}`), { at: new Date() });
+    await setDoc(doc(db, 'chats/alice_bob/messages/mine'), msg('alice'));
+    await setDoc(doc(db, 'chats/alice_bob/messages/theirs'), msg('bob'));
+  });
+  await assertSucceeds(updateDoc(doc(alice, 'users/alice'), { deleting: true }));
+  // The old mobile code always failed here, including when the collection was empty.
+  await assertFails(getDocs(collection(alice, 'users/alice/limits')));
+  await assertFails(getDocs(collection(alice, 'users/alice/challengeProof')));
+  await assertFails(getDoc(doc(alice, 'chats/alice_bob/messages/theirs')));
+  await assertSucceeds(deleteDoc(doc(alice, 'users/alice')));
+  // Neither a stale token nor an invite-less account can read incoming messages.
+  await assertFails(getDoc(doc(alice, 'chats/alice_bob/messages/theirs')));
+  const chats = await assertSucceeds(getDocs(query(collection(alice, 'chats'), where('participants', 'array-contains', 'alice'))));
+  for (const chat of chats.docs) {
+    const messages = await assertSucceeds(getDocs(query(collection(alice, `chats/${chat.id}/messages`), where('senderUid', '==', 'alice'))));
+    for (const message of messages.docs) await assertSucceeds(deleteDoc(message.ref));
+  }
+  const devices = await assertSucceeds(getDocs(collection(alice, 'users/alice/devices')));
+  for (const device of devices.docs) {
+    const prekeys = await assertSucceeds(getDocs(collection(device.ref, 'prekeys')));
+    for (const prekey of prekeys.docs) await assertSucceeds(deleteDoc(prekey.ref));
+    await assertSucceeds(deleteDoc(device.ref));
+  }
+  for (const name of ['pushTokens', 'linkRequests', 'blocks']) {
+    const docs = await assertSucceeds(getDocs(collection(alice, `users/alice/${name}`)));
+    for (const d of docs.docs) await assertSucceeds(deleteDoc(d.ref));
+  }
+  for (const path of ['private/backup', 'limits/send', 'limits/chats', 'limits/claims', 'challengeProof/current']) {
+    await assertSucceeds(deleteDoc(doc(alice, `users/alice/${path}`)));
+  }
+  await assertSucceeds(getDoc(doc(alice, 'usernames/alice')));
+  await assertSucceeds(deleteDoc(doc(alice, 'usernames/alice')));
+  await assertSucceeds(getDoc(doc(alice, 'usernames/alice'))); // repeat after a lost acknowledgement
+  await assertFails(getDoc(doc(alice, 'usernames/bob')));
+  await assertFails(getDocs(collection(alice, 'users/bob/devices')));
+  await assertSucceeds(getDoc(doc(bob, 'chats/alice_bob/messages/theirs')));
 });
 
 // ---------- bans (set by the operator tooling as a custom claim) ----------
@@ -1075,9 +1242,7 @@ test('push tokens: token shape and device status are validated', async () => {
   await assertFails(setDoc(ref('device-0001'), pushToken({ token: 'short' })));
   await assertFails(setDoc(ref('device-0001'), pushToken({ extra: true })));
   await assertSucceeds(setDoc(ref('device-0001'), pushToken()));
-  await updateDoc(doc(ctx('alice'), 'users/alice/devices/device-0001'), {
-    revokedAt: serverTimestamp(),
-  });
+  await revokeAsServer('users/alice/devices/device-0001');
   await assertFails(setDoc(ref('device-0001'), pushToken({ token: 'fcm-token-after-revoke-0123456789' })));
 });
 test('push tokens: a profile is required too (device alone is not enough)', async () => {
@@ -1110,7 +1275,7 @@ test('push tokens: the optional data-push capability must be a boolean', async (
   await signUp('alice', 'alice');
   await setDoc(doc(ctx('alice'), 'users/alice/devices/device-0001'), deviceDoc());
   const ref = doc(ctx('alice'), 'users/alice/pushTokens/device-0001');
-  const android = (over) => pushToken({ platform: 'android', ...over });
+  const android = (over?) => pushToken({ platform: 'android', ...over });
   await assertSucceeds(setDoc(ref, android({ dataPush: true, showName: false, sound: true })));
   await assertSucceeds(updateDoc(ref, android({ dataPush: false })));
   await assertSucceeds(setDoc(ref, android())); // older apps omit it
@@ -1128,6 +1293,15 @@ test('push throttle: clients can neither read nor write it', async () => {
   await assertFails(setDoc(ref, { bob: serverTimestamp() }));
 });
 
+test('a message may be marked quiet, and only with true', async () => {
+  await setupChat();
+  const ref = (id) => doc(ctx('alice'), `chats/alice_bob/messages/${id}`);
+  for (const bad of [false, 'true', 1, null]) {
+    await assertFails(setMsg(ref(`bad-${String(bad)}`), msg('alice', { quiet: bad })));
+  }
+  await assertSucceeds(setMsg(ref('q1'), msg('alice', { quiet: true })));
+});
+
 // ---------- retention: message expiry and account activity ----------
 test('retention: a message must carry an expireAt about 30 days out (28 to 32 days)', async () => {
   await setupChat();
@@ -1142,18 +1316,53 @@ test('retention: a message must carry an expireAt about 30 days out (28 to 32 da
   await assertSucceeds(setMsg(ref('ok31'), msg('alice', { expireAt: new Date(Date.now() + 31 * DAY) })));
 });
 
-test('retention: lastActiveAt can only be set to the server time, and at most every 12 hours', async () => {
+test('the public profile holds no activity stamp: it cannot be written, only removed', async () => {
   await signUp('alice', 'alice'); await signUp('bob', 'bob');
   const mine = () => doc(ctx('alice'), 'users', 'alice');
-  await assertFails(updateDoc(mine(), { lastActiveAt: new Date() }));                 // client clock refused
-  await assertFails(updateDoc(doc(ctx('bob'), 'users', 'alice'), { lastActiveAt: serverTimestamp() })); // not yours
-  await assertSucceeds(updateDoc(mine(), { lastActiveAt: serverTimestamp() }));       // first stamp
-  await assertFails(updateDoc(mine(), { lastActiveAt: serverTimestamp() }));          // too soon
-  await assertSucceeds(updateDoc(mine(), { displayName: 'Al' }));                     // other edits unaffected
+  // An app from before decision 0026 still tries. It is refused, and nothing else of it breaks.
+  await assertFails(updateDoc(mine(), { lastActiveAt: serverTimestamp() }));
+  await assertFails(updateDoc(mine(), { lastActiveAt: new Date() }));
+  await assertSucceeds(updateDoc(mine(), { displayName: 'Al' }));
+  // A profile that still carries one from before: other edits work, it cannot be changed, it can go.
   await env.withSecurityRulesDisabled(async (c) => {
     await updateDoc(doc(c.firestore(), 'users', 'alice'), { lastActiveAt: new Date(Date.now() - 13 * 3600e3) });
   });
-  await assertSucceeds(updateDoc(mine(), { lastActiveAt: serverTimestamp() }));       // 13 h later is fine
+  await assertSucceeds(updateDoc(mine(), { displayName: 'Alice' }));
+  await assertFails(updateDoc(mine(), { lastActiveAt: serverTimestamp() }));
+  await assertSucceeds(updateDoc(mine(), { lastActiveAt: deleteField() }));
+  // What another account reads has neither field once they are removed.
+  await assertSucceeds(updateDoc(mine(), { invite: deleteField() }));
+  const seen = (await assertSucceeds(getDoc(doc(ctx('bob'), 'users', 'alice')))).data() ?? {};
+  assert.ok(!('lastActiveAt' in seen) && !('invite' in seen));
+  // The invite hash cannot be put back or changed.
+  await assertFails(updateDoc(mine(), { invite: 'a'.repeat(64) }));
+  await assertFails(updateDoc(doc(ctx('alice'), 'users', 'bob'), { invite: deleteField() })); // not yours
+});
+
+test('profile colour: the owner sets a colour name, and nobody else can', async () => {
+  await signUp('alice', 'alice'); await signUp('bob', 'bob');
+  const mine = () => doc(ctx('alice'), 'users', 'alice');
+  const stamp = { colorAt: serverTimestamp() };
+  const later = () => env.withSecurityRulesDisabled(async (c) => {
+    await updateDoc(doc(c.firestore(), 'users', 'alice'), { colorAt: new Date(Date.now() - 6000) });
+  });
+  await assertFails(updateDoc(mine(), { color: 'plum' }));                            // no stamp
+  await assertFails(updateDoc(mine(), { color: 'plum', colorAt: new Date() }));       // client clock refused
+  await assertSucceeds(updateDoc(mine(), { color: 'plum', ...stamp }));
+  await assertFails(updateDoc(mine(), { color: 'forest', ...stamp }));                // too soon
+  await assertFails(updateDoc(mine(), stamp));                                        // a stamp without a change
+  await assertSucceeds(updateDoc(mine(), { displayName: 'Al' }));                     // other edits unaffected
+  await later();
+  await assertSucceeds(updateDoc(mine(), { color: 'forest', ...stamp }));             // 6 s later is fine
+  await later();
+  for (const bad of ['Plum', '', '#ff0000', 'plum;drop', 'x'.repeat(25), 7, ['plum'], null]) {
+    await assertFails(updateDoc(mine(), { color: bad, ...stamp }));
+  }
+  await assertFails(updateDoc(doc(ctx('bob'), 'users', 'alice'), { color: 'ocean', ...stamp })); // not yours
+  // Anyone with a profile reads it with the username; someone signed out does not.
+  const seen = await assertSucceeds(getDoc(doc(ctx('bob'), 'users', 'alice')));
+  assert.equal(seen.data()?.color, 'forest');
+  await assertFails(getDoc(doc(env.unauthenticatedContext().firestore(), 'users', 'alice')));
 });
 
 // ---------- deletion fence ----------

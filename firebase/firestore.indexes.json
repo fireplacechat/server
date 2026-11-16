@@ -28,6 +28,47 @@
       "fieldPath": "expireAt",
       "ttl": true,
       "indexes": []
+    },
+    {
+      "collectionGroup": "events",
+      "fieldPath": "expireAt",
+      "ttl": true,
+      "indexes": []
+    },
+    {
+      "collectionGroup": "events",
+      "fieldPath": "ct",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "commits",
+      "fieldPath": "ct",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "welcomes",
+      "fieldPath": "ct",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "ops",
+      "fieldPath": "ct",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "mlsPackages",
+      "fieldPath": "kp",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "ops",
+      "fieldPath": "commit",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "ops",
+      "fieldPath": "welcome",
+      "indexes": []
     }
   ]
 }

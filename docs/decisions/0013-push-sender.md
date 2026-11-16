@@ -44,6 +44,6 @@ of its chats. Its `pushTokens` were already deleted.
 ## Supersedes
 
 [0005](0005-invites-and-rate-limit.md): "Cloud Functions / Blaze remain off".
-Costs: [COSTS.md](../push/COSTS.md). Tests: `functions/test/push-core.test.js`,
+Costs: [COSTS.md](../push/COSTS.md). Tests: `functions/test/push-core.test.ts`,
 rules tests for `showName`, `sound` and `pushThrottle`, and the operator deletion test.
 Implementation assisted by Claude Code.

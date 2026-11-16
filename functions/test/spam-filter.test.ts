@@ -1,17 +1,18 @@
 // The spam filter's hook (decision 0018), with stand-in policies: the deployed
-// policy is private and tested in spam-policy.private.test.js.
+// policy is private and tested in spam-policy.private.test.ts.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { handleReport } from '../lib/spam-filter.js';
-import { POLICY as EXAMPLE } from '../lib/spam-policy.example.js';
+import { handleReport } from '../lib/spam-filter.ts';
+import type { SpamPolicy, SpamStore } from '../lib/spam-filter.ts';
+import { POLICY as EXAMPLE } from '../lib/spam-policy.example.ts';
 
 const DAY = 86400e3;
 const NOW = Date.UTC(2026, 10, 12, 12);
 
-function fixture({ reporters = 1, createdMs = NOW - 365 * DAY, restriction = null, challengeResult = 'sent', decide } = {}) {
-  const state = { restricted: null, queued: [], since: null, asked: null, challenge: null };
-  const store = {
+function fixture({ reporters = 1, createdMs = NOW - 365 * DAY, restriction = null, challengeResult = 'sent', decide }: any = {}) {
+  const state: any = { restricted: null, queued: [], since: null, asked: null, challenge: null };
+  const store: SpamStore = {
     reportersSince: async (uid, sinceMs) => { state.since = sinceMs; return reporters; },
     accountCreatedMs: async () => createdMs,
     restriction: async () => restriction,
@@ -19,7 +20,7 @@ function fixture({ reporters = 1, createdMs = NOW - 365 * DAY, restriction = nul
     challenge: async (uid, until) => { state.challenge = { uid, until }; return challengeResult; },
     queue: async (uid, entry) => { state.queued.push({ uid, ...entry }); },
   };
-  const policy = {
+  const policy: SpamPolicy = {
     reportWindowMs: 7 * DAY,
     assess: (input) => { state.asked = input; return decide(input); },
   };

@@ -5,20 +5,25 @@ Apple's App Review Guideline 5.1.1(v) requires apps that let people create an ac
 ## What is deleted
 | Data | Where | How |
 |---|---|---|
-| Sign-in account (synthetic email + password hash) | Firebase Auth | `User.delete()` (last step) |
+| Sign-in account (synthetic email + password hash) | Firebase Auth | `User.delete()`, then explicit local signout |
 | Username claim, public profile | Firestore `usernames/{name}`, `users/{uid}` | deleted; the username becomes available again |
 | Devices, public keys, certificates, prekeys | `users/{uid}/devices/*` and `.../prekeys/*` | deleted |
 | Recovery-key backup, link requests, block list | `users/{uid}/private`, `linkRequests`, `blocks` | deleted |
 | Every message the user sent | `chats/*/messages` where `senderUid == uid` | deleted in batches |
-| Keys, sessions, message history, settings on the phone | Keychain / Keystore, encrypted message files | wiped (`SecretStore.clear`, message store destroyed) |
+| Group memberships, group lists, invitations and MLS key packages | `groups/*` rosters, `users/{uid}/groupRefs`, `groupInvites`, `devices/*/mlsPackages` | removed from every group at once when deletion starts ([decision 0023](decisions/0023-group-chats.md)); the group is fenced until a member's Commit removes the devices |
+| Invite codes the user made for other people, unused | `users/{uid}/inviteSlots/*`, `invites/*` where `by == uid` | deleted ([decision 0021](decisions/0021-person-invites.md)) |
+| Keys, sessions, message history, settings on the phone | Keychain / Keystore, encrypted message files | erased only for the confirmed account; other local accounts are preserved |
 
 ## What remains, and why
-- **Messages other people sent to this account** stay until those people's apps tidy up. They are end-to-end encrypted to keys that no longer exist, so they cannot be read by anyone. When the other person's app sees that the profile is gone it deletes the rest of the conversation (their own messages and the chat document) and their local copy.
+- **Messages other people sent to this account** remain encrypted until the sender explicitly removes the conversation, deletes their own account, or the server's message expiry removes them. The sender's local history is preserved.
 - **Messages already delivered** to other people's devices stay on those devices; the sender cannot remove them (same as every encrypted messenger).
-- **Reports** filed by or about the account are kept to handle abuse. They contain only user ids, the chosen reason, the optional note and any message text the reporter chose to attach.
+- **Spam reports** remain so abuse can be handled. They name accounts and do not include message text.
+- **Used invites**, the account's own and those it gave out, remain so the operator can trace who invited whom. They hold no code, only account ids. An unused code left behind by an older app is refused at sign-up once the account is being deleted or gone.
 - Firebase may keep routine infrastructure logs and backups for a limited time under its own policies.
 
 ## Failure handling
+The client deletes named `limits/send`, `limits/chats`, `limits/claims` and `challengeProof/current` documents; it must never list those collections. Owner device/prekey reads and the matching username read remain available when an earlier deletion already removed the profile. Incoming ciphertext reads stop at the deletion fence; only the account's own sent records remain readable for cleanup. See [decision 0022](decisions/0022-account-deletion-resume.md).
+
 Deletion is a sequence of idempotent steps. Before deleting anything the profile is flagged `deleting: true`; if the app is closed or loses network mid-way, the next sign-in shows **Finish deleting** instead of the normal app, and the same steps run again. If only the final sign-in-account removal fails, the data is already gone and the user is told to sign in again and retry.
 
 ## For App Review notes

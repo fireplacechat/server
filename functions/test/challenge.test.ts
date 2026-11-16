@@ -2,7 +2,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { challengeMessage, clearAnsweredChallenge, issueChallenge } from '../lib/challenge.js';
+import { challengeMessage, clearAnsweredChallenge, issueChallenge } from '../lib/challenge.ts';
+import type { ChallengeMessage } from '../lib/challenge.ts';
 
 const until = Date.UTC(2026, 10, 19);
 const fixed = () => Buffer.from('ab'.repeat(32), 'hex');
@@ -25,8 +26,8 @@ test('no registered device means no challenge is stored', async () => {
 });
 
 test('a challenge is stored and pushed to each live device', async () => {
-  const pushes = [];
-  let saved = null;
+  const pushes: ChallengeMessage[] = [];
+  let saved: any = null;
   const result = await issueChallenge(
     { uid: 'mallory', untilMs: until, tokens: ['a', 'b'], random: fixed },
     {

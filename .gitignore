@@ -1,2 +1,10 @@
 node_modules/
+functions/build/
 *.log
+.env
+.env.*
+*-key.json
+service-account*.json
+*.pem
+*.jks
+*.keystore

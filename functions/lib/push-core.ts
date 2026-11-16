@@ -9,6 +9,8 @@
 
 import { createHash } from 'node:crypto';
 
+import type { ChatDoc, Coded, MessageDoc, ProfileDoc, PushTokenRecord, Untrusted } from './types.ts';
+
 export const PUSH_BODY = 'New Message';
 // Title on devices that turned off "Show sender's name" in the app.
 export const HIDDEN_TITLE = 'Fireplace';
@@ -34,8 +36,85 @@ const DEAD_TOKEN = new Set([
   'messaging/invalid-registration-token',
 ]);
 
+/**
+ * What an app that posts its own notification receives (decision 0019). The
+ * keys are part of the contract with the app: `fp` is DATA_MARKER, `k` the
+ * conversation key, `ch` the Android channel. All values are strings.
+ */
+export interface DataPush {
+  token: string;
+  data: { fp: '1'; k: string; title: string; ch: string };
+  android: { priority: 'high'; collapseKey: string };
+}
+
+/** What every other device receives: a notification the system shows as sent. */
+export interface AlertPush {
+  token: string;
+  notification: { title: string; body: string };
+  apns: {
+    headers: { 'apns-collapse-id': string; 'apns-push-type': 'alert'; 'apns-priority': '10' };
+    payload: { aps: { 'thread-id': string; 'mutable-content': 1; sound?: string } };
+  };
+  android: {
+    priority: 'high';
+    collapseKey: string;
+    notification: { tag: string; channelId: string; color: string };
+  };
+}
+
+/** One FCM message for one token. Neither form has message text, a chat id or an envelope. */
+export type PushMessage = DataPush | AlertPush;
+
+/** Why a message did or did not produce a push. Safe to log: no ids, usernames or tokens. */
+export type PushOutcome =
+  | 'malformed'
+  | 'no-envelopes'
+  | 'no-chat'
+  | 'request'
+  | 'blocked'
+  | 'recipient-gone'
+  | 'sender-gone'
+  | 'no-tokens'
+  | 'throttled'
+  | 'quiet'
+  | 'sent'
+  | 'failed';
+
+export interface PushStore {
+  getChat(chatId: string): Promise<Untrusted<ChatDoc> | null>;
+  isBlocked(ownerUid: string, blockedUid: string): Promise<boolean>;
+  getProfile(uid: string): Promise<Untrusted<ProfileDoc> | null>;
+  listTokens(uid: string): Promise<PushTokenRecord[]>;
+  /**
+   * Whether this conversation alerted this recipient within the window: one
+   * read, checked before the other lookups so a burst costs one read a
+   * message, not five. Optional; without it every message does the lookups.
+   */
+  peekThrottle?(chatId: string, recipientUid: string, nowMs: number, windowMs: number): Promise<boolean>;
+  /** Transactional. */
+  claimThrottle(chatId: string, recipientUid: string, nowMs: number, windowMs: number): Promise<boolean>;
+  deleteToken(uid: string, deviceId: string): Promise<unknown>;
+}
+
+/** Rejects with `{code}` on failure. */
+export interface PushMessaging {
+  send(message: PushMessage): Promise<unknown>;
+}
+
+/** One device's registration and choices, already checked. */
+export interface BuildInput {
+  token: string;
+  username: string;
+  chatId: string;
+  showName?: boolean;
+  sound?: boolean;
+  /** Read from the registration as written: only 'android' is tested for. */
+  platform?: unknown;
+  dataPush?: boolean;
+}
+
 /** Splits `uidA_uidB` and returns the recipient, or null if malformed. */
-export function recipientOf(chatId, senderUid) {
+export function recipientOf(chatId: string, senderUid: string): string | null {
   const parts = String(chatId).split('_');
   if (parts.length !== 2 || !parts.every((p) => UID.test(p))) return null;
   if (parts[0] === parts[1]) return null;
@@ -49,7 +128,7 @@ export function recipientOf(chatId, senderUid) {
  * thread id and the Android tag, so a conversation keeps one alert that
  * replaces itself. Hashed so Apple and Google do not see account ids in it.
  */
-export function conversationKey(chatId) {
+export function conversationKey(chatId: string): string {
   return createHash('sha256').update(`fireplace-push:${chatId}`).digest('hex').slice(0, 32);
 }
 
@@ -64,6 +143,9 @@ export function conversationKey(chatId) {
  * gets the notification payload. iOS adds `mutable-content`, so a Notification
  * Service Extension may rewrite the alert; without one iOS shows it as sent.
  */
+export function buildMessage(input: BuildInput & { platform: 'android'; dataPush: true }): DataPush;
+export function buildMessage(input: BuildInput & { dataPush?: false }): AlertPush;
+export function buildMessage(input: BuildInput): PushMessage;
 export function buildMessage({
   token,
   username,
@@ -72,7 +154,7 @@ export function buildMessage({
   sound = true,
   platform,
   dataPush = false,
-}) {
+}: BuildInput): PushMessage {
   const key = conversationKey(chatId);
   const title = showName ? username : HIDDEN_TITLE;
   const channelId = sound ? ANDROID_CHANNEL : ANDROID_SILENT_CHANNEL;
@@ -84,7 +166,7 @@ export function buildMessage({
       android: { priority: 'high', collapseKey: key },
     };
   }
-  const aps = { 'thread-id': key, 'mutable-content': 1 };
+  const aps: AlertPush['apns']['payload']['aps'] = { 'thread-id': key, 'mutable-content': 1 };
   if (sound) aps.sound = IOS_SOUND;
   return {
     token,
@@ -121,17 +203,37 @@ export function buildMessage({
  * }
  * messaging: { send(message) -> Promise }   (rejects with {code} on failure)
  */
-export async function handleMessage({ chatId, data, now = Date.now() }, { store, messaging }) {
+export async function handleMessage(
+  { chatId, data, now = Date.now() }: {
+    chatId: string;
+    data: Untrusted<MessageDoc> | null | undefined;
+    now?: number;
+  },
+  { store, messaging }: { store: PushStore; messaging: PushMessaging },
+): Promise<PushOutcome> {
   const senderUid = data?.senderUid;
   if (typeof senderUid !== 'string') return 'malformed';
   const recipientUid = recipientOf(chatId, senderUid);
   if (!recipientUid) return 'malformed';
-  const envelopes = data.envelopes;
+  const envelopes = data!.envelopes;
   if (!envelopes || typeof envelopes !== 'object') return 'malformed';
   // Only the recipient's devices that actually got a copy. The sender's own
   // linked devices also receive envelopes; they never get a push.
   const reached = new Set(Object.keys(envelopes).filter((d) => DEVICE.test(d)));
   if (reached.size === 0) return 'no-envelopes';
+  // A quiet message (an edit, a delete, a cleared reaction) is never an alert
+  // (decision 0025). Android apps that post their own notifications still get
+  // it as data, so they can update or remove the alert it is about; when the
+  // recipient has no such device, that is one read and nothing else.
+  const quiet = data!.quiet === true;
+  if (quiet) {
+    const own = (await store.listTokens(recipientUid)).some(
+      (t) => reached.has(t.deviceId) && t.platform === 'android' && t.dataPush === true,
+    );
+    if (!own) return 'quiet';
+  } else if (await store.peekThrottle?.(chatId, recipientUid, now, THROTTLE)) {
+    return 'throttled';
+  }
 
   // Every lookup at once: one round of reads instead of four in a row. A
   // silent request or a block now reads a few documents it does not need,
@@ -156,11 +258,14 @@ export async function handleMessage({ chatId, data, now = Date.now() }, { store,
   if (typeof username !== 'string' || !USERNAME.test(username)) return 'sender-gone';
 
   const tokens = allTokens.filter(
-    (t) => reached.has(t.deviceId) && typeof t.token === 'string' && t.token.length >= 20,
+    (t): t is PushTokenRecord & { token: string } =>
+      reached.has(t.deviceId) && typeof t.token === 'string' && t.token.length >= 20 &&
+      (!quiet || (t.platform === 'android' && t.dataPush === true)),
   );
-  if (tokens.length === 0) return 'no-tokens';
+  if (tokens.length === 0) return quiet ? 'quiet' : 'no-tokens';
 
-  if (!(await store.claimThrottle(chatId, recipientUid, now, THROTTLE))) return 'throttled';
+  // A quiet message neither uses nor waits for the alert allowance.
+  if (!quiet && !(await store.claimThrottle(chatId, recipientUid, now, THROTTLE))) return 'throttled';
 
   let sent = 0;
   await Promise.all(
@@ -180,11 +285,12 @@ export async function handleMessage({ chatId, data, now = Date.now() }, { store,
         );
         sent++;
       } catch (e) {
-        if (DEAD_TOKEN.has(e?.code)) {
+        if (DEAD_TOKEN.has((e as Coded)?.code)) {
           await store.deleteToken(recipientUid, deviceId).catch(() => {});
         }
       }
     }),
   );
+  if (quiet) return 'quiet';
   return sent > 0 ? 'sent' : 'failed';
 }

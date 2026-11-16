@@ -15,11 +15,11 @@ in the last 7 days and looks at the account's age, then:
   fewer if the account is new. A longer restriction already set is kept.
 
 It never bans; a person does, with `fp-ops ban`. The server code is only the
-hook: `spam-filter.js` gathers what the filter may look
+hook: `spam-filter.ts` gathers what the filter may look
 at, asks the policy, and applies its decision (and refuses anything but a
 review, a time-limited restriction, or a challenge (0020)). The policy that decides,
-`functions/lib/spam-policy.js`, stays private; the public code carries
-`spam-policy.example.js`, a stand-in with the same shape and no threshold.
+`functions/lib/spam-policy.ts`, stays private; the public code carries
+`spam-policy.example.ts`, a stand-in with the same shape and no threshold.
 
 ## What it looks at
 
