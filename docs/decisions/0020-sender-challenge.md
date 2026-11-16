@@ -50,9 +50,9 @@ far enough out that waiting is not useful. A person clears a stuck account
 by removing the claim and the hold (the console, until `fp-ops` grows a
 command for it).
 
-`clearAnsweredChallenge` in `functions/lib/challenge.js` checks a token and
+`clearAnsweredChallenge` in `functions/lib/challenge.ts` checks a token and
 removes the claim and the hold, which stops the extra reads below. It is not
-deployed: wiring it is one export in `functions/index.js`, and that file is
+deployed: wiring it is one export in `functions/index.ts`, and that file is
 being edited for notification previews (issue #22). Until that export exists,
 a solved challenge still allows sends, and the extra reads last until `until`.
 

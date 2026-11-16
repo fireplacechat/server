@@ -22,6 +22,30 @@ service cloud.firestore {
     // Only people who signed up with an invite have a profile. Everything that costs us
     // storage or reads requires one, so an account created without an invite is inert.
     function hasProfile(uid) { return exists(userPath(uid)); }
+    // Starting fresh with a wait (decision 0027). A new phone that has only the password
+    // asks to start fresh; the account's devices are told and can stop it. Until the wait
+    // has passed, nothing a start needs (removing the devices, the recovery backup) is let
+    // through. The same holds for a session that never asked: it has no start at all.
+    function startFreshPath(uid) { return /databases/$(database)/documents/users/$(uid)/private/startFresh; }
+    function securityPath(uid) { return /databases/$(database)/documents/users/$(uid)/private/security; }
+    function waitDays(uid) {
+      return exists(securityPath(uid)) ? get(securityPath(uid)).data.get('waitDays', 3) : 3;
+    }
+    function startFreshReady(uid) {
+      return exists(startFreshPath(uid))
+        && request.time >= get(startFreshPath(uid)).data.startedAt
+             + duration.value(get(startFreshPath(uid)).data.waitDays, 'd');
+    }
+    // The account is being deleted (flagged, or its profile already removed): its clean-up
+    // removes everything and waits for nothing.
+    function goingAway(uid) {
+      return !exists(userPath(uid)) || get(userPath(uid)).data.get('deleting', false) == true;
+    }
+    // The password was typed again within the last five minutes.
+    function freshSignIn() {
+      return request.auth.token.auth_time is int
+        && request.auth.token.auth_time >= request.time.toMillis() / 1000 - 300;
+    }
     // Deletion fence. Once an account is flagged `deleting` (by the app or by the operator's
     // `fp-ops delete`) its devices can still DELETE what they own, but can no longer create or
     // change anything, so no installation can add records behind the clean-up's back. A missing
@@ -85,7 +109,10 @@ service cloud.firestore {
     // started, and one-time prekeys claimed from other accounts' devices.
     function countPath(uid, name) { return /databases/$(database)/documents/users/$(uid)/limits/$(name); }
     function dailyCap(name) {
-      return name == 'chats' ? (restricted() ? 5 : 50) : (restricted() ? 20 : 200);
+      return name == 'chats' ? (restricted() ? 5 : 50)
+        // Group membership requests (decision 0023): each runs a function.
+        : name == 'groupOps' ? (restricted() ? 20 : 100)
+        : (restricted() ? 20 : 200);
     }
     // The action is counted: its counter is written in the same batch (apps from v0.3.4).
     function counted(name) {
@@ -101,9 +128,84 @@ service cloud.firestore {
     }
     function chatPath(id) { return /databases/$(database)/documents/chats/$(id); }
 
+    // Person-to-person invites (decision 0021). Each account has invite rows that unlock
+    // a number of seconds after the account was created. The operator sets the schedule in
+    // config/invites, can replace it for one account in inviteAllowances/{uid}, and can
+    // pause either. Without either document the default is one now, one after a day and
+    // one after a week.
+    function slotPath(uid, row) { return /databases/$(database)/documents/users/$(uid)/inviteSlots/$(row); }
+    function inviteConfigPath() { return /databases/$(database)/documents/config/invites; }
+    function allowancePath(uid) { return /databases/$(database)/documents/inviteAllowances/$(uid); }
+    function banPath(uid) { return /databases/$(database)/documents/bans/$(uid); }
+    function defaultUnlocks() { return [0, 86400, 604800]; }
+    function inviteConfig() {
+      return exists(inviteConfigPath()) ? get(inviteConfigPath()).data : {};
+    }
+    function inviteSchedule(uid) {
+      return exists(allowancePath(uid)) ? get(allowancePath(uid)).data : inviteConfig();
+    }
+    // A signed-in, unrestricted account in good standing, writing for itself.
+    function mayInvite(uid) {
+      return isOwner(uid) && notBanned() && !restricted()
+        && hasProfile(uid) && notDeleting(uid) && !exists(banPath(uid));
+    }
+    // Row `row` exists in this account's schedule and has unlocked, and nothing is paused.
+    function rowOpen(uid, row) {
+      let schedule = inviteSchedule(uid);
+      let unlocks = schedule.get('unlockAfter', defaultUnlocks());
+      return row.matches('^[0-9]$') && int(row) < unlocks.size()
+        && inviteConfig().get('paused', false) != true
+        && schedule.get('paused', false) != true
+        && request.time >= get(userPath(uid)).data.createdAt + duration.value(unlocks[int(row)], 's');
+    }
+    // The code is well formed, its SHA-256 is the invite id, and that invite is created in
+    // the same batch for this row. The code is chosen by the app; a weak one only hurts
+    // the person who shares it.
+    function slotCode(uid, row) {
+      let d = request.resource.data;
+      return d.code is string && d.code.matches('^[A-Z2-7]{16}$')
+        && d.invite == hashing.sha256(d.code).toHexString().lower()
+        && d.at == request.time
+        && getAfter(invitePath(d.invite)).data.by == uid
+        && getAfter(invitePath(d.invite)).data.slot == int(row);
+    }
+    // Swapping an unused code for a new one: the old invite is deleted in the same batch.
+    // The first swap of a row is immediate, later ones wait an hour, which bounds writes.
+    function replaceCode(uid, row) {
+      return mayInvite(uid) && rowOpen(uid, row)
+        && hasOnly(['code', 'invite', 'at', 'replacedAt'])
+        && hasAll(['code', 'invite', 'at', 'replacedAt'])
+        && !('used' in resource.data)
+        && request.resource.data.invite != resource.data.invite
+        && request.resource.data.replacedAt == request.time
+        && (!('replacedAt' in resource.data)
+            || request.time >= resource.data.replacedAt + duration.value(1, 'h'))
+        && !existsAfter(invitePath(resource.data.invite))
+        && slotCode(uid, row);
+    }
+    // The sign-up that claims this row's invite marks the row used, and nothing else.
+    function markUsed() {
+      return signedIn()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['used'])
+        && request.resource.data.used == true
+        && !('usedBy' in get(invitePath(resource.data.invite)).data)
+        && getAfter(invitePath(resource.data.invite)).data.get('usedBy', null) == request.auth.uid;
+    }
+    // A person's code works only while that person's account is in good standing, and the
+    // sign-up must mark their row used in the same batch.
+    function personInviteRedeemable(hash, invite) {
+      let row = getAfter(slotPath(invite.by, string(invite.slot))).data;
+      return hasProfile(invite.by) && notDeleting(invite.by) && !exists(banPath(invite.by))
+        && row.invite == hash && row.get('used', false) == true;
+    }
+
     // usernames/{username} -> { uid }. Create-only, so names are unique and permanent.
     match /usernames/{username} {
-      allow get: if signedIn() && hasProfile(request.auth.uid);
+      allow get: if signedIn() && (hasProfile(request.auth.uid)
+        // A deletion may have removed the profile before releasing its name.
+        // Read only the signed-in owner's name (or its confirmed absence).
+        || (request.auth.token.email == username + '@users.fireplace.invalid'
+            && (!exists(usernamePath(username)) || resource.data.uid == request.auth.uid)));
       allow list: if false; // no enumeration
       allow create: if signedIn()
         && validUsername(username)
@@ -134,14 +236,27 @@ service cloud.firestore {
         && request.resource.data.createdAt == request.time
         && getAfter(usernamePath(request.resource.data.username)).data.uid == uid;
       allow update: if isOwner(uid) && notDeleting(uid)
-        && hasOnly(['username', 'displayName', 'createdAt', 'deleting', 'invite', 'lastActiveAt'])
-        && request.resource.data.get('invite', null) == resource.data.get('invite', null)
-        // Retention: accounts inactive for 13 months are deleted. `lastActiveAt` can only be set to the
-        // server time, and at most every 12 hours.
-        && (request.resource.data.get('lastActiveAt', null) == resource.data.get('lastActiveAt', null)
-            || (request.resource.data.lastActiveAt == request.time
-                && (resource.data.get('lastActiveAt', null) == null
-                    || request.time > resource.data.lastActiveAt + duration.value(12, 'h'))))
+        && hasOnly(['username', 'displayName', 'createdAt', 'deleting', 'invite', 'lastActiveAt', 'color', 'colorAt'])
+        // The profile is readable by every signed-in account, so it holds nothing private
+        // (decision 0026). The invite hash is needed only while the account is created, and
+        // `lastActiveAt` is no longer written: either may stay as it is or be removed, never
+        // set or changed.
+        && (!('invite' in request.resource.data)
+            || request.resource.data.invite == resource.data.get('invite', null))
+        && (!('lastActiveAt' in request.resource.data)
+            || request.resource.data.lastActiveAt == resource.data.get('lastActiveAt', null))
+        // The account's chat colour (decision 0024): public, like the username. A colour's name.
+        && (!('color' in request.resource.data)
+            || (request.resource.data.color is string && request.resource.data.color.matches('^[a-z]{1,24}$')))
+        // Rate limit: a change of colour is stamped with the server time, and the next one is
+        // refused for 5 seconds. The app saves a colour only after it has been held for 10.
+        && ((request.resource.data.get('color', null) == resource.data.get('color', null)
+             && request.resource.data.get('colorAt', null) == resource.data.get('colorAt', null))
+            || ('color' in request.resource.data
+                && request.resource.data.get('color', null) != resource.data.get('color', null)
+                && request.resource.data.colorAt == request.time
+                && (resource.data.get('colorAt', null) == null
+                    || request.time > resource.data.colorAt + duration.value(5, 's'))))
         && request.resource.data.username == resource.data.username
         && request.resource.data.createdAt == resource.data.createdAt
         && request.resource.data.displayName is string
@@ -153,7 +268,7 @@ service cloud.firestore {
 
       // users/{uid}/devices/{deviceId}: per-device public keys.
       match /devices/{deviceId} {
-        allow get, list: if signedIn() && hasProfile(request.auth.uid);
+        allow get, list: if isOwner(uid) || (signedIn() && hasProfile(request.auth.uid));
         allow create: if isOwner(uid) && hasProfile(uid) && notDeleting(uid)
           && deviceId.matches('^[A-Za-z0-9_-]{8,64}$')
           && hasOnly(['x25519Pub', 'kemPub', 'sigPub', 'deviceCert', 'createdAt'])
@@ -163,17 +278,18 @@ service cloud.firestore {
           && request.resource.data.sigPub is string && request.resource.data.sigPub.size() <= 4096
           && request.resource.data.deviceCert is string && request.resource.data.deviceCert.size() <= 8192
           && request.resource.data.createdAt == request.time;
-        // keys are immutable; the only allowed change is revoking the device
-        allow update: if isOwner(uid) && notDeleting(uid)
-          && hasOnly(['x25519Pub', 'kemPub', 'sigPub', 'deviceCert', 'createdAt', 'revokedAt'])
-          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['revokedAt'])
-          && request.resource.data.revokedAt == request.time;
-        allow delete: if isOwner(uid);
+        // Keys are immutable. A device is removed by another device of the account, through
+        // a request the function checks (decision 0027): a session that has only the password
+        // could otherwise remove the phone of the person and then wait out a start unopposed.
+        allow update: if false;
+        // Deleting device records is how an identity is replaced. It waits for a start that
+        // is over its wait, unless the account is being deleted.
+        allow delete: if isOwner(uid) && (goingAway(uid) || startFreshReady(uid));
 
         // users/{uid}/devices/{deviceId}/prekeys/{id}: public prekeys that peers
         // claim to start sessions (signed prekey + a pool of one-time prekeys).
         match /prekeys/{pkId} {
-          allow get, list: if signedIn() && hasProfile(request.auth.uid);
+          allow get, list: if isOwner(uid) || (signedIn() && hasProfile(request.auth.uid));
           allow create: if isOwner(uid) && hasProfile(uid) && notDeleting(uid)
             && pkId.matches('^[A-Za-z0-9_-]{6,32}$')
             && hasOnly(['kind', 'x25519Pub', 'kemPub', 'sig', 'createdAt'])
@@ -225,13 +341,56 @@ service cloud.firestore {
     // users/{uid}/private/backup: identity encrypted client-side with the user's
     // recovery key. Owner-only; the server cannot read its contents.
     match /users/{uid}/private/{docId} {
-      allow read, delete: if isOwner(uid) && docId == 'backup';
+      allow read: if isOwner(uid) && docId in ['backup', 'security', 'startFresh'];
+      // The recovery backup goes with the identity: removed only by a start that is over
+      // its wait, or with the account.
+      allow delete: if isOwner(uid) && docId == 'backup' && (goingAway(uid) || startFreshReady(uid));
+
+      // The lost-phone wait. Chosen once while the account is being made (its profile is
+      // minutes old); afterwards only a device changes it, through the function.
+      allow create: if isOwner(uid) && docId == 'security' && notDeleting(uid)
+        && hasOnly(['waitDays']) && request.resource.data.waitDays in [1, 3, 7, 14, 30]
+        && get(userPath(uid)).data.createdAt > request.time - duration.value(10, 'm');
+
+      // A start that is waiting. Anyone signed in to the account may ask; the time of the
+      // server and the wait of the account are what count. `session` is the sign-in time of
+      // the asker: only that sign-in may withdraw it, so a stolen phone cannot cancel the
+      // start of the person it was stolen from.
+      allow create: if isOwner(uid) && docId == 'startFresh' && hasProfile(uid) && notDeleting(uid)
+        && hasOnly(['startedAt', 'waitDays', 'session']) && hasAll(['startedAt', 'waitDays', 'session'])
+        && request.resource.data.startedAt == request.time
+        && request.resource.data.waitDays == waitDays(uid)
+        && request.resource.data.session == request.auth.token.auth_time;
+      allow delete: if isOwner(uid) && docId == 'startFresh'
+        && (resource.data.get('session', null) == request.auth.token.auth_time
+            || resource.data.get('by', null) == 'device'
+            || goingAway(uid));
       allow create, update: if isOwner(uid) && docId == 'backup' && hasProfile(uid) && notDeleting(uid)
         && hasOnly(['blob', 'v', 'createdAt']) && hasAll(['blob', 'v', 'createdAt'])
         && request.resource.data.v == 1
         && request.resource.data.blob is string
         && request.resource.data.blob.size() <= 30000
         && request.resource.data.createdAt == request.time;
+    }
+
+    // users/{uid}/accountOps/{opId}: requests only a device may make (decision 0027). The
+    // function checks the proof and does the work; nobody writes the outcome but it.
+    // Stopping a waiting start also needs the password typed again just now.
+    match /users/{uid}/accountOps/{opId} {
+      allow get: if isOwner(uid);
+      allow create: if isOwner(uid) && hasProfile(uid) && notDeleting(uid)
+        && opId.matches('^[A-Za-z0-9_-]{8,64}$')
+        && request.resource.data.at == request.time
+        // `key` only asks the function to make the key of the server if there is none
+        // yet, so the app can fetch its public half. It proves and changes nothing.
+        && ((hasOnly(['kind', 'at']) && request.resource.data.kind == 'key')
+            || (hasOnly(['kind', 'device', 'proof', 'at', 'waitDays', 'target'])
+                && hasAll(['kind', 'device', 'proof', 'at'])
+                && request.resource.data.kind in ['setWait', 'stop', 'removeDevice', 'resetNow']
+                && request.resource.data.device is string && request.resource.data.device.size() <= 64
+                && request.resource.data.proof is string && request.resource.data.proof.size() <= 64))
+        && (request.resource.data.kind != 'stop' || freshSignIn());
+      allow list, update, delete: if false;
     }
 
     // users/{uid}/linkRequests/{deviceId}: a new device asks an existing device of
@@ -305,12 +464,31 @@ service cloud.firestore {
       allow delete: if false;
     }
 
-    // invites/{sha256(code)}: created by the operator (Admin SDK, see tools/operator).
-    // A new account claims one in the same batch that creates its profile. Clients can
-    // neither read nor create invites; the hash of the code is the document id, so the
-    // code itself is never stored.
+    // invites/{sha256(code)}: created by the operator (Admin SDK, see tools/operator), or by
+    // an account for one of its invite rows (decision 0021: then the invite has `by` and
+    // `slot`). A new account claims one in the same batch that creates its profile. The hash
+    // of the code is the document id, so the invite itself never holds the code.
     match /invites/{hash} {
-      allow get, list, create, delete: if false;
+      allow list: if false;
+      // Whoever holds an unused code from a person may see whose row it is, so the sign-up
+      // batch can mark that row used. Operator invites and used invites stay unreadable, so
+      // an inviter never learns who joined.
+      allow get: if signedIn() && 'by' in resource.data && !('usedBy' in resource.data);
+      allow create: if signedIn() && hash.matches('^[0-9a-f]{64}$')
+        && hasOnly(['by', 'slot', 'createdAt']) && hasAll(['by', 'slot', 'createdAt'])
+        && request.resource.data.by == request.auth.uid
+        && request.resource.data.slot is int
+        && request.resource.data.createdAt == request.time
+        // The row's own rule checks the schedule, the code and its hash.
+        && getAfter(slotPath(request.auth.uid, string(request.resource.data.slot))).data.invite == hash;
+      // An unused code of your own goes when you replace it (the row then holds another
+      // code) or when your account is being deleted.
+      allow delete: if signedIn()
+        && resource.data.get('by', null) == request.auth.uid
+        && !('usedBy' in resource.data)
+        && (!hasProfile(request.auth.uid)
+            || get(userPath(request.auth.uid)).data.get('deleting', false) == true
+            || getAfter(slotPath(request.auth.uid, string(resource.data.slot))).data.invite != hash);
       // A moderator token must not claim an invite: that is how an account gets a profile,
       // and a profile would put this login on the normal app path.
       allow update: if signedIn()
@@ -319,7 +497,33 @@ service cloud.firestore {
         && !('usedBy' in resource.data)
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['usedBy', 'usedAt'])
         && request.resource.data.usedBy == request.auth.uid
-        && request.resource.data.usedAt == request.time;
+        && request.resource.data.usedAt == request.time
+        && (!('by' in resource.data) || personInviteRedeemable(hash, resource.data));
+    }
+
+    // config/invites: the operator's default invite schedule for every account (decision
+    // 0021). Admin SDK only; accounts read it to draw their invite page.
+    match /config/{docId} {
+      allow get: if docId in ['invites', 'deviceProof'] && signedIn() && hasProfile(request.auth.uid);
+      allow list, write: if false;
+    }
+    // inviteAllowances/{uid}: the operator's schedule for one account, replacing the default.
+    match /inviteAllowances/{uid} {
+      allow get: if isOwner(uid);
+      allow list, write: if false;
+    }
+
+    // users/{uid}/inviteSlots/{row}: the code this account made for invite row `row`
+    // (decision 0021). Only the owner reads it. `used` is set by the sign-up that claims it.
+    match /users/{uid}/inviteSlots/{row} {
+      allow get, list: if isOwner(uid);
+      allow create: if mayInvite(uid) && rowOpen(uid, row)
+        && hasOnly(['code', 'invite', 'at']) && hasAll(['code', 'invite', 'at'])
+        && slotCode(uid, row);
+      allow update: if replaceCode(uid, row) || markUsed();
+      // Only account deletion removes a row, so deleting it cannot reset the schedule.
+      allow delete: if isOwner(uid)
+        && (!hasProfile(uid) || get(userPath(uid)).data.get('deleting', false) == true);
     }
 
     // users/{uid}/limits/send: this account's send clock, written with every message.
@@ -368,12 +572,12 @@ service cloud.firestore {
           && request.resource.data.today == resource.data.today + 1
           && request.resource.data.today <= cap;
       }
-      allow get: if isOwner(uid) && docId in ['send', 'chats', 'claims'];
-      allow create: if isOwner(uid) && docId in ['chats', 'claims'] && hasProfile(uid)
+      allow get: if isOwner(uid) && docId in ['send', 'chats', 'claims', 'groupOps'];
+      allow create: if isOwner(uid) && docId in ['chats', 'claims', 'groupOps'] && hasProfile(uid)
         && notDeleting(uid) && hasOnly(['at', 'day', 'today']) && sendClock() && opensDay();
-      allow update: if isOwner(uid) && docId in ['chats', 'claims'] && notDeleting(uid)
+      allow update: if isOwner(uid) && docId in ['chats', 'claims', 'groupOps'] && notDeleting(uid)
         && dayCounter();
-      allow delete: if isOwner(uid) && docId in ['chats', 'claims']
+      allow delete: if isOwner(uid) && docId in ['chats', 'claims', 'groupOps']
         && (!hasProfile(uid) || get(userPath(uid)).data.get('deleting', false) == true);
       // Deleting the clock would restart the counts, so only account deletion may (the app
       // marks the profile `deleting` first; a profile already gone counts too).
@@ -449,11 +653,19 @@ service cloud.firestore {
 
       // Messages: per-recipient-device ciphertext envelopes. No plaintext fields allowed.
       match /messages/{msgId} {
-        allow get, list: if isParticipant();
+        // After deletion starts, only this account's remaining sent records
+        // stay readable for cleanup. A cached ID token must
+        // not retain access to incoming ciphertext after the profile is gone.
+        allow get, list: if isParticipant()
+          && ((hasProfile(request.auth.uid) && notDeleting(request.auth.uid))
+              || resource.data.senderUid == request.auth.uid);
         allow create: if isParticipant() && notBanned() && notDeleting(request.auth.uid)
           && (!challenged() || challengeSolved())
-          && hasOnly(['senderUid', 'senderDevice', 'ts', 'envelopes', 'expireAt'])
+          && hasOnly(['senderUid', 'senderDevice', 'ts', 'envelopes', 'expireAt', 'quiet'])
           && hasAll(['senderUid', 'senderDevice', 'ts', 'envelopes', 'expireAt'])
+          // A quiet message (an edit, a delete, a cleared reaction, a group colour or notice) causes no
+          // alert (decision 0025). The mark says only that it is not a message a person reads.
+          && (!('quiet' in request.resource.data) || request.resource.data.quiet == true)
           && request.resource.data.senderUid == request.auth.uid
           && request.resource.data.senderDevice is string
           && request.resource.data.senderDevice.size() <= 64
@@ -497,6 +709,137 @@ service cloud.firestore {
     // The catch-all below covers it; named here so the rule is deliberate.
     match /pushThrottle/{chatId} {
       allow read, write: if false;
+    }
+
+
+    // ---------------------------------------------------------------- groups
+    // Group chats over MLS (backend decision 0023, mobile decision 0050). The server
+    // keeps the public roster and ciphertext; names, roles and messages are encrypted.
+    // Messages and self-update Commits are written here under these rules; every
+    // membership change is a request in `ops`/`groupOps`, completed by a function.
+    function groupPath(gid) { return /databases/$(database)/documents/groups/$(gid); }
+    function group(gid) { return get(groupPath(gid)).data; }
+    function liveAccount() {
+      return signedIn() && notBanned() && hasProfile(request.auth.uid) && notDeleting(request.auth.uid);
+    }
+    function isMember(gid) { return request.auth.uid in group(gid).members; }
+    function memberDevice(gid, device) {
+      return device is string && device in group(gid).members[request.auth.uid].devices;
+    }
+    // Commit slots are named by the epoch they start from, zero-padded so they sort.
+    function epochId(epoch) {
+      return ('000000000000' + string(epoch))[string(epoch).size():];
+    }
+    function opCounted() { return counted('groupOps'); }
+
+    match /groups/{gid} {
+      allow get: if liveAccount() && request.auth.uid in resource.data.members;
+      allow list, create, delete: if false;
+      // A member's self-update or rename Commit raises the epoch by one, nothing else.
+      allow update: if liveAccount() && request.auth.uid in resource.data.members
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['epoch'])
+        && request.resource.data.epoch == resource.data.epoch + 1
+        && getAfter(/databases/$(database)/documents/groups/$(gid)/commits/$(epochId(resource.data.epoch))).data.by
+           == request.auth.uid;
+
+      match /commits/{epoch} {
+        allow get, list: if liveAccount() && isMember(gid);
+        allow update, delete: if false;
+        allow create: if liveAccount() && isMember(gid)
+          && (!challenged() || challengeSolved())
+          && epoch == epochId(group(gid).epoch)
+          && hasOnly(['e', 'by', 'device', 'kind', 'ct', 'at']) && hasAll(['e', 'by', 'device', 'kind', 'ct', 'at'])
+          // The epoch as a number too, so members can query the Commits after theirs.
+          && request.resource.data.e == group(gid).epoch
+          && request.resource.data.by == request.auth.uid
+          && memberDevice(gid, request.resource.data.device)
+          && request.resource.data.kind in ['update', 'meta']
+          && request.resource.data.ct is bytes && request.resource.data.ct.size() <= 262144
+          && request.resource.data.at == request.time
+          && getAfter(groupPath(gid)).data.epoch == group(gid).epoch + 1;
+      }
+
+      match /events/{opId} {
+        allow get, list: if liveAccount() && isMember(gid);
+        allow update, delete: if false;
+        allow create: if liveAccount() && isMember(gid)
+          && (!challenged() || challengeSolved())
+          && group(gid).fence.size() == 0
+          && hasOnly(['by', 'device', 'n', 'epoch', 'ct', 'at', 'expireAt', 'quiet'])
+          && hasAll(['by', 'device', 'n', 'epoch', 'ct', 'at', 'expireAt'])
+          // A quiet message (an edit, a delete, a cleared reaction, a group colour or notice) causes no
+          // alert (decision 0025). The mark says only that it is not a message a person reads.
+          && (!('quiet' in request.resource.data) || request.resource.data.quiet == true)
+          && request.resource.data.by == request.auth.uid
+          && memberDevice(gid, request.resource.data.device)
+          // One id per device and counter: a repeated create is refused, never doubled.
+          && request.resource.data.n is int && request.resource.data.n >= 0
+          && opId == request.resource.data.device + '-' + string(request.resource.data.n)
+          // The current epoch, or the one before for a send that raced a Commit.
+          && request.resource.data.epoch is int
+          && request.resource.data.epoch >= group(gid).epoch - 1
+          && request.resource.data.epoch <= group(gid).epoch
+          && request.resource.data.ct is bytes && request.resource.data.ct.size() <= 98304
+          && request.resource.data.at == request.time
+          && request.resource.data.expireAt is timestamp
+          && request.resource.data.expireAt >= request.time + duration.value(28, 'd')
+          && request.resource.data.expireAt <= request.time + duration.value(32, 'd')
+          // Groups share the account's send allowance with 1:1 chats (decision 0015).
+          && sendPaced();
+      }
+
+      // One Welcome per joining account and epoch, readable by that account only.
+      match /welcomes/{id} {
+        allow get, list: if signedIn() && resource.data.uid == request.auth.uid;
+        allow write: if false;
+      }
+
+      // Membership requests; the function fills in `status`.
+      match /ops/{opId} {
+        allow get: if signedIn() && resource.data.by == request.auth.uid;
+        allow list, update, delete: if false;
+        allow create: if liveAccount() && isMember(gid) && opCounted()
+          && opId.matches('^[A-Za-z0-9_-]{8,64}$')
+          && hasOnly(['kind', 'by', 'at', 'uid', 'epoch', 'commit', 'welcome', 'packages', 'devices', 'device', 'admins'])
+          && request.resource.data.kind in ['invite', 'expire', 'addDevice', 'remove', 'leave', 'finalize', 'roles']
+          && request.resource.data.by == request.auth.uid
+          && request.resource.data.at == request.time
+          && (!('commit' in request.resource.data)
+              || (request.resource.data.commit is bytes && request.resource.data.commit.size() <= 262144))
+          && (!('welcome' in request.resource.data)
+              || (request.resource.data.welcome is bytes && request.resource.data.welcome.size() <= 786432));
+      }
+    }
+
+    // Account-level group requests: create a group, or answer an invitation.
+    match /users/{uid}/groupOps/{opId} {
+      allow get: if isOwner(uid);
+      allow list, update, delete: if false;
+      allow create: if isOwner(uid) && liveAccount() && opCounted()
+        && opId.matches('^[A-Za-z0-9_-]{8,64}$')
+        && hasOnly(['kind', 'by', 'at', 'gid', 'devices', 'epoch'])
+        && request.resource.data.kind in ['create', 'accept', 'decline']
+        && request.resource.data.by == uid
+        && request.resource.data.at == request.time
+        && request.resource.data.gid is string && request.resource.data.gid.matches('^[A-Za-z0-9_-]{22}$');
+    }
+    match /users/{uid}/groupRefs/{gid} {
+      allow get, list: if isOwner(uid);
+      allow write: if false;
+    }
+    match /users/{uid}/groupInvites/{gid} {
+      allow get, list: if isOwner(uid);
+      allow write: if false;
+    }
+    // Up to ten one-use key packages per device, in slots 0-9. The function consumes them.
+    match /users/{uid}/devices/{deviceId}/mlsPackages/{slot} {
+      allow get, list: if liveAccount();
+      allow create, update: if isOwner(uid) && liveAccount()
+        && slot.matches('^[0-9]$')
+        && hasOnly(['kp', 'createdAt']) && hasAll(['kp', 'createdAt'])
+        && request.resource.data.kp is bytes && request.resource.data.kp.size() <= 16384
+        && request.resource.data.createdAt == request.time;
+      allow delete: if isOwner(uid);
     }
 
     match /{document=**} { allow read, write: if false; }

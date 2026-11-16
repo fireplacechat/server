@@ -13,7 +13,8 @@ import {
   ANDROID_SILENT_CHANNEL,
   THROTTLE,
   DATA_MARKER,
-} from '../lib/push-core.js';
+} from '../lib/push-core.ts';
+import type { PushMessaging, PushStore } from '../lib/push-core.ts';
 
 const CHAT = 'alice_bob';
 const ALICE_DEV = 'alice-device-1';
@@ -22,7 +23,7 @@ const BOB_TABLET = 'bob-tablet-001';
 const TOKEN = (n) => `fcm-token-${n}-0123456789abcdef`;
 
 function fixture(over = {}) {
-  const state = {
+  const state: any = {
     chats: { [CHAT]: { accepted: true, initiator: 'alice' } },
     blocks: new Set(),
     profiles: {
@@ -42,7 +43,7 @@ function fixture(over = {}) {
     failures: {},
     ...over,
   };
-  const store = {
+  const store: PushStore = {
     getChat: async (id) => state.chats[id] ?? null,
     isBlocked: async (owner, blocked) => state.blocks.has(`${owner}>${blocked}`),
     getProfile: async (uid) => state.profiles[uid] ?? null,
@@ -56,7 +57,7 @@ function fixture(over = {}) {
     },
     deleteToken: async (uid, deviceId) => state.deleted.push(`${uid}/${deviceId}`),
   };
-  const messaging = {
+  const messaging: PushMessaging = {
     send: async (m) => {
       const code = state.failures[m.token];
       if (code) throw Object.assign(new Error('fcm'), { code });
@@ -270,7 +271,7 @@ test('all lookups for a message run at once, not one after another', async () =>
     return fn(...args);
   };
   for (const name of ['getChat', 'isBlocked', 'getProfile', 'listTokens']) {
-    store[name] = overlapping(store[name]);
+    (store as any)[name] = overlapping((store as any)[name]);
   }
   const result = await handleMessage(
     { chatId: CHAT, data: { senderUid: 'alice', envelopes: { [BOB_PHONE]: {} } } },
@@ -379,4 +380,67 @@ test('data pushes share the per-conversation throttle', async () => {
   assert.equal(await at(1e6 + THROTTLE), 'sent');
   assert.equal(state.sent.length, 2);
   assert.ok(state.sent.every((m) => 'data' in m));
+});
+
+// ---------------------------------------------------------------- quiet messages (decision 0025)
+
+test('a quiet message alerts nobody and reads only the recipient\'s tokens', async () => {
+  const { state, deps } = fixture();
+  const calls: string[] = [];
+  const store = {
+    ...deps.store,
+    getChat: async (id) => (calls.push('chat'), deps.store.getChat(id)),
+    getProfile: async (uid) => (calls.push('profile'), deps.store.getProfile(uid)),
+    isBlocked: async (a, b) => (calls.push('block'), deps.store.isBlocked(a, b)),
+    listTokens: async (uid) => (calls.push('tokens'), deps.store.listTokens(uid)),
+    claimThrottle: async () => assert.fail('a quiet message does not touch the throttle'),
+  };
+  const result = await handleMessage({ chatId: CHAT, data: { ...message(), quiet: true }, now: 1e6 }, { ...deps, store });
+  assert.equal(result, 'quiet');
+  assert.equal(state.sent.length, 0);
+  assert.deepEqual(calls, ['tokens']);
+  // Only `true` is quiet.
+  assert.equal(await handleMessage({ chatId: CHAT, data: { ...message(), quiet: 'yes' as any }, now: 1e6 }, deps), 'sent');
+});
+
+test('a quiet message still reaches an Android app that posts its own notifications, as data only', async () => {
+  const { state, deps } = fixture({
+    tokens: {
+      bob: [
+        { deviceId: BOB_PHONE, token: TOKEN(1), platform: 'android', dataPush: true },
+        { deviceId: BOB_TABLET, token: TOKEN(2), platform: 'ios' },
+      ],
+    },
+  });
+  // The alert allowance is used up: a quiet message does not wait for it, and does not use it.
+  state.throttle[`${CHAT}/bob`] = 1e6;
+  assert.equal(await handleMessage({ chatId: CHAT, data: { ...message(), quiet: true }, now: 1e6 + 1 }, deps), 'quiet');
+  assert.deepEqual(state.sent.map((m) => m.token), [TOKEN(1)]);
+  assert.equal(state.sent[0].notification, undefined);
+  assert.equal(state.sent[0].data[DATA_MARKER], '1');
+  assert.equal(state.throttle[`${CHAT}/bob`], 1e6);
+  // A block still holds for it.
+  const blocked = fixture({ tokens: { bob: [{ deviceId: BOB_PHONE, token: TOKEN(1), platform: 'android', dataPush: true }] }, blocks: new Set(['bob>alice']) });
+  assert.equal(await handleMessage({ chatId: CHAT, data: { ...message(), quiet: true }, now: 1e6 }, blocked.deps), 'blocked');
+  assert.equal(blocked.state.sent.length, 0);
+});
+
+test('a message inside the throttle window costs one lookup, not five', async () => {
+  const { state, deps } = fixture();
+  const calls: string[] = [];
+  const store = {
+    ...deps.store,
+    peekThrottle: async (chatId, uid, now, window) => {
+      calls.push('peek');
+      const last = state.throttle[`${chatId}/${uid}`];
+      return last !== undefined && now - last < window;
+    },
+    getChat: async (id) => (calls.push('chat'), deps.store.getChat(id)),
+    listTokens: async (uid) => (calls.push('tokens'), deps.store.listTokens(uid)),
+  };
+  assert.equal(await handleMessage({ chatId: CHAT, data: message(), now: 1e6 }, { ...deps, store }), 'sent');
+  calls.length = 0;
+  assert.equal(await handleMessage({ chatId: CHAT, data: message(), now: 1e6 + 1000 }, { ...deps, store }), 'throttled');
+  assert.deepEqual(calls, ['peek']);
+  assert.equal(await handleMessage({ chatId: CHAT, data: message(), now: 1e6 + THROTTLE + 1 }, { ...deps, store }), 'sent');
 });

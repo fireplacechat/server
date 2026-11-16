@@ -34,7 +34,7 @@ and show the preview themselves (or "New Message"); see
   counts.
 - **Sender:** `functions/` holds the `pushOnMessage` Cloud Function, triggered
   by `chats/{chatId}/messages/{msgId}` creates. The decisions are in
-  `functions/lib/push-core.js`:
+  `functions/lib/push-core.ts`:
   - alerts only the recipient's devices that received an envelope, never the
     sender's own devices;
   - skips unaccepted message requests, blocked senders, and deleted or

@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { initializeTestEnvironment, assertSucceeds } from '@firebase/rules-unit-testing';
 import { doc, setDoc, updateDoc, writeBatch, serverTimestamp, getDoc } from 'firebase/firestore';
 
-const fx = JSON.parse(readFileSync(new URL('./fixtures/app_docs.json', import.meta.url)));
+const fx = JSON.parse(readFileSync(new URL('./fixtures/app_docs.json', import.meta.url)) as unknown as string);
 // honour FIRESTORE_EMULATOR_HOST (set by `firebase emulators:exec`) so other ports work
 function emulatorHostPort() {
   const [host, port] = (process.env.FIRESTORE_EMULATOR_HOST || '127.0.0.1:8080').split(':');

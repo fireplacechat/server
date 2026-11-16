@@ -66,7 +66,7 @@ the rules are live. The function can go out at the same time:
 
 ## Tests
 
-`functions/test/push-core.test.js`: the data payload's shape and its string
+`functions/test/push-core.test.ts`: the data payload's shape and its string
 values; no text, chat id, account id or envelope in it; the name and sound
 choices kept; older apps and iOS keep the notification payload;
 `mutable-content` on iOS with and without sound; the throttle shared. The

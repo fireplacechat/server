@@ -1,11 +1,14 @@
-// The `store` used by spam-filter.js, backed by the Admin SDK. Kept thin on
-// purpose: every decision is in spam-filter.js and tested there.
+// The `store` used by spam-filter.ts, backed by the Admin SDK. Kept thin on
+// purpose: every decision is in spam-filter.ts and tested there.
 
+import type { Auth } from 'firebase-admin/auth';
+import type { Firestore } from 'firebase-admin/firestore';
 import { getMessaging } from 'firebase-admin/messaging';
 
-import { issueChallenge } from './challenge.js';
+import { issueChallenge } from './challenge.ts';
+import type { SpamStore } from './spam-filter.ts';
 
-export function spamStore(db, auth) {
+export function spamStore(db: Firestore, auth: Auth): SpamStore {
   return {
     async reportersSince(uid, sinceMs) {
       // One reports document per reporter (reports/{reporter}_{reported}), so
@@ -37,7 +40,7 @@ export function spamStore(db, auth) {
       const snap = await db.collection(`users/${uid}/pushTokens`).get();
       const tokens = snap.docs
         .map((d) => d.get('token'))
-        .filter((token) => typeof token === 'string' && token.length > 0);
+        .filter((token): token is string => typeof token === 'string' && token.length > 0);
       return issueChallenge({ uid, untilMs, tokens }, {
         async save(id, token, until) {
           await db.doc(`challengeHolds/${id}`).set({ token, until: new Date(until) });
@@ -48,7 +51,7 @@ export function spamStore(db, auth) {
         async clear(id) {
           await db.doc(`challengeHolds/${id}`).delete();
           const user = await auth.getUser(id);
-          const claims = { ...(user.customClaims ?? {}) };
+          const claims: Record<string, unknown> = { ...(user.customClaims ?? {}) };
           delete claims.challengeUntil;
           await auth.setCustomUserClaims(id, claims);
         },
